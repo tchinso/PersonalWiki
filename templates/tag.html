@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block title %}#{{ tag_name }} | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>태그: #{{ tag_name }}</h1>
+  <p class="muted">문서 {{ docs|length }}건</p>
+  {% if docs %}
+    <ul class="doc-list">
+      {% for doc in docs %}
+        <li class="doc-item">
+          <div class="doc-head">
+            <a class="doc-title" href="{{ url_for('view_doc', slug=doc.slug) }}">{{ doc.title }}</a>
+            <span class="doc-time">{{ doc.updated_at|pretty_time }}</span>
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>해당 태그 문서가 없습니다.</p>
+  {% endif %}
+</section>
+{% endblock %}

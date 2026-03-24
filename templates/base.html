@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Personal Wiki{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="{{ url_for('index') }}">Personal Wiki</a>
+        <nav class="menu">
+          <a href="{{ url_for('index') }}">문서 목록</a>
+          <a href="{{ url_for('new_doc') }}">새 문서</a>
+        </nav>
+        <form class="search-form" action="{{ url_for('search') }}" method="get">
+          <input
+            type="text"
+            name="q"
+            value="{{ request.args.get('q', '') }}"
+            placeholder="검색 (AND / OR / NOT)"
+            autocomplete="off"
+          >
+          <button type="submit">검색</button>
+        </form>
+      </div>
+    </header>
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

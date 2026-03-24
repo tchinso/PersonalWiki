@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}검색 | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>검색</h1>
+  <p class="muted">제목 + 본문 통합 검색, 연산자: <code>AND</code> <code>OR</code> <code>NOT</code></p>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if query %}
+    <p>검색어: <strong>{{ query }}</strong></p>
+    <p class="muted">결과 {{ results|length }}건</p>
+    {% if results %}
+      <ul class="doc-list">
+        {% for item in results %}
+          <li class="doc-item">
+            <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
+            <p class="excerpt">{{ item.excerpt|safe }}</p>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>검색 결과가 없습니다.</p>
+    {% endif %}
+  {% else %}
+    <p>상단 검색창에 검색어를 입력해 주세요.</p>
+  {% endif %}
+</section>
+{% endblock %}

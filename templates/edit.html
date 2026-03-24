@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% if mode == "new" %}
+  {% set page_title = "새 문서" %}
+{% else %}
+  {% set page_title = "문서 수정" %}
+{% endif %}
+
+{% block title %}{{ page_title }} | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>{{ page_title }}</h1>
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" class="edit-form">
+    <label for="title">제목</label>
+    <input id="title" name="title" type="text" value="{{ doc.title }}" required>
+
+    <label for="tags">태그 (콤마 구분)</label>
+    <input id="tags" name="tags" type="text" value="{{ tags_text }}" placeholder="예: flask, wiki, note">
+
+    <label for="content">Markdown 내용 (GFM)</label>
+    <textarea id="content" name="content" rows="18" required>{{ content }}</textarea>
+
+    <div class="hint">
+      문서 링크: <code>[[문서명]]</code>,
+      이미지: <code>![[파일명.png]]</code>,
+      템플릿 포함: <code>{{ "{{템플릿문서}}" }}</code>
+    </div>
+
+    <button class="button" type="submit">저장</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>미리보기</h2>
+  <article id="preview" class="markdown-body"></article>
+</section>
+
+<script src="{{ url_for('static', filename='editor.js') }}"></script>
+{% endblock %}

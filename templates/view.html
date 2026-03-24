@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}{{ doc.title }} | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <header class="doc-header">
+    <div>
+      <h1>{{ doc.title }}</h1>
+      <p class="muted">
+        생성: {{ doc.created_at|pretty_time }} /
+        수정: {{ doc.updated_at|pretty_time }}
+      </p>
+      {% if doc.tags %}
+        <div class="tag-row">
+          {% for tag in doc.tags %}
+            <a class="tag" href="{{ url_for('docs_by_tag', tag_name=tag) }}">#{{ tag }}</a>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+    <div class="actions">
+      <a class="button" href="{{ url_for('edit_doc', slug=doc.slug) }}">수정</a>
+      <form action="{{ url_for('delete_doc', slug=doc.slug) }}" method="post" onsubmit="return confirm('문서를 삭제할까요?');">
+        <button class="button danger" type="submit">삭제</button>
+      </form>
+    </div>
+  </header>
+  <article class="markdown-body">{{ rendered }}</article>
+</section>
+{% endblock %}

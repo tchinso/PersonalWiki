@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}문서 없음 | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <h1>문서를 찾을 수 없습니다.</h1>
+  <p><code>{{ requested }}</code> 문서가 없습니다.</p>
+  <p><a class="button" href="{{ url_for('new_doc', title=requested) }}">이 제목으로 새 문서 만들기</a></p>
+</section>
+{% endblock %}
