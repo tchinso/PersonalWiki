@@ -257,22 +257,37 @@ def sidecar_path(slug: str) -> Path:
     return DOC_DIR / f"{slug}.json"
 
 
+def normalize_newlines(text: str) -> str:
+    if not text:
+        return ""
+    # Repair malformed CRCRLF sequences caused by double newline translation.
+    normalized = text.replace("\r\r\n", "\n")
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized
+
+
+def read_text_normalized(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as file:
+        return normalize_newlines(file.read())
+
+
 def read_document(slug: str) -> str:
     path = document_path(slug)
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8")
+    return read_text_normalized(path)
 
 
 def read_document_if_exists(slug: str) -> str | None:
     path = document_path(slug)
     if not path.exists():
         return None
-    return path.read_text(encoding="utf-8")
+    return read_text_normalized(path)
 
 
 def write_document(slug: str, content: str) -> None:
-    document_path(slug).write_text(content, encoding="utf-8")
+    normalized = normalize_newlines(content)
+    document_path(slug).write_text(normalized, encoding="utf-8", newline="\n")
 
 
 def load_sidecar(slug: str) -> dict:
@@ -308,6 +323,7 @@ def write_sidecar(
     sidecar_path(slug).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
+        newline="\n",
     )
 
 
@@ -595,7 +611,7 @@ def sync_documents() -> None:
         for md_file in md_files:
             slug = md_file.stem
             seen_slugs.add(slug)
-            content = md_file.read_text(encoding="utf-8")
+            content = read_text_normalized(md_file)
             row = existing_by_slug.get(slug)
 
             if row is None:
@@ -795,7 +811,7 @@ def new_doc():
 
     if request.method == "POST":
         title = request.form.get("title", "").strip()
-        content = request.form.get("content", "")
+        content = normalize_newlines(request.form.get("content", ""))
         tags = parse_tags(request.form.get("tags", ""))
         ignore_tag_warning = request.form.get("ignore_tag_warning") == "1"
         suggested_tags = recommend_tags(
@@ -916,7 +932,7 @@ def edit_doc(slug: str):
 
     if request.method == "POST":
         new_title = request.form.get("title", "").strip()
-        new_content = request.form.get("content", "")
+        new_content = normalize_newlines(request.form.get("content", ""))
         new_tags = parse_tags(request.form.get("tags", ""))
         suggested_tags = recommend_tags(
             conn,
@@ -1137,7 +1153,7 @@ def search():
 def preview():
     conn = get_db()
     payload = request.get_json(silent=True) or {}
-    content = str(payload.get("content", ""))
+    content = normalize_newlines(str(payload.get("content", "")))
     html = render_markdown(conn, content)
     return jsonify({"html": str(html)})
 
@@ -1148,7 +1164,7 @@ def tag_suggestions():
     payload = request.get_json(silent=True) or {}
 
     title = str(payload.get("title", "")).strip()
-    content = str(payload.get("content", ""))
+    content = normalize_newlines(str(payload.get("content", "")))
     current_slug = str(payload.get("slug", "")).strip() or None
 
     raw_tags = payload.get("tags", "")
