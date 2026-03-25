@@ -14,24 +14,50 @@
   {% if error %}
     <p class="error">{{ error }}</p>
   {% endif %}
+  {% if tag_warning %}
+    <p class="warning">{{ tag_warning }}</p>
+  {% endif %}
 
-  <form method="post" class="edit-form">
+  <form method="post" class="edit-form" data-current-slug="{{ doc.slug or '' }}">
     <label for="title">제목</label>
     <input id="title" name="title" type="text" value="{{ doc.title }}" required>
 
     <label for="tags">태그 (콤마 구분)</label>
     <input id="tags" name="tags" type="text" value="{{ tags_text }}" placeholder="예: flask, wiki, note">
 
+    <section class="tag-suggest-box">
+      <div class="tag-suggest-head">
+        <strong>태그 자동 추천</strong>
+        <button class="button secondary" type="button" id="suggest-tags-btn">추천 갱신</button>
+      </div>
+      <p class="muted">불용어/복수형 정규화 + TF-IDF + 코사인 유사도로 최대 10개를 추천합니다.</p>
+      <div
+        id="tag-suggestions"
+        class="tag-suggestion-row"
+        data-initial='{{ recommended_tags|tojson|safe }}'
+      ></div>
+    </section>
+
     <label for="content">Markdown 내용 (GFM)</label>
     <textarea id="content" name="content" rows="18" required>{{ content }}</textarea>
 
     <div class="hint">
       문서 링크: <code>[[문서명]]</code>,
-      이미지: <code>![[파일명.png]]</code>,
-      템플릿 포함: <code>{{ "{{템플릿문서}}" }}</code>
+      하이라이트: <code>==강조==</code>,
+      스포일러: <code>||숨김||</code>,
+      유튜브: <code>![[youtube(HhnETSN6U_E, width=640, height=360)]]</code>,
+      템플릿: <code>{{ "{{템플릿문서}}" }}</code>,
+      콜아웃: <code>!!! note 내용</code>
     </div>
 
-    <button class="button" type="submit">저장</button>
+    <div class="button-row">
+      <button class="button" type="submit">저장</button>
+      {% if mode == "new" and show_ignore_tag_warning %}
+        <button class="button secondary" type="submit" name="ignore_tag_warning" value="1">
+          경고 무시하고 생성
+        </button>
+      {% endif %}
+    </div>
   </form>
 </section>
 
@@ -39,6 +65,8 @@
   <h2>미리보기</h2>
   <article id="preview" class="markdown-body"></article>
 </section>
+{% endblock %}
 
+{% block extra_scripts %}
 <script src="{{ url_for('static', filename='editor.js') }}"></script>
 {% endblock %}

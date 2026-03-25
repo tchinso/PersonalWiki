@@ -1,0 +1,1 @@
+Outer start {{TemplateInner}} outer end

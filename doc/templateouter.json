@@ -1,0 +1,12 @@
+{
+  "title": "TemplateOuter",
+  "slug": "templateouter",
+  "created_at": "2026-03-25T16:40:27",
+  "updated_at": "2026-03-25T16:40:27",
+  "tags": [
+    "tmp"
+  ],
+  "meta": {
+    "sidecar": "templateouter.json"
+  }
+}

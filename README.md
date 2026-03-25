@@ -1,21 +1,34 @@
 # Personal Wiki (Flask + SQLite + JSON)
 
-개인 용도로 로컬에서 실행하는 위키입니다.
+개인 PC에서 실행하는 로컬 위키입니다.
 
-## 요구사항 반영
+## 주요 기능
 
-- Flask 웹 앱
-- 폴더 구조
-  - `/doc`: 마크다운 문서(`.md`) + 문서 메타데이터(`.json`)
-  - `/img`: 이미지 파일
-  - `wiki.db`: SQLite 데이터베이스(태그, 검색 인덱스 등)
-- 브라우저에서 Markdown 작성/수정 + 실시간 미리보기
-- GFM 스타일 렌더링(테이블, 취소선, 태스크리스트, URL 등)
-- 위키 링크: `[[문서명]]`, `[[문서명|표시텍스트]]`
-- 이미지 단축 문법: `![[파일명.png]]` → `/img/파일명.png`
-- 템플릿 포함 문법: `{{문서명}}`
-- 태그 관리 + 태그 클릭 페이지
-- 제목+본문 검색 + `AND OR NOT` 연산자
+- Markdown 문서 작성/수정 + 실시간 미리보기
+- 위키 링크: `[[문서명]]` 또는 `[[문서명|표시 텍스트]]`
+- 이미지 삽입: `![[파일명.png]]`
+- 하이라이트: `==강조==`
+- 스포일러: `||숨김 텍스트||` (클릭 토글)
+- 유튜브 임베드:
+  - `![[youtube(HhnETSN6U_E)]]`
+  - `![[youtube(HhnETSN6U_E, width=640, height=360)]]`
+- 콜아웃:
+  - `!!! note 내용` (초록)
+  - `!!! info 내용` (파랑)
+  - `!!! warn 내용` (주황)
+  - `!!! danger 내용` (빨강)
+- 템플릿 포함: `{{템플릿문서}}` (한 번만 확장, 중첩 템플릿 미확장)
+- 백링크: 현재 문서를 링크/템플릿 참조한 문서 목록
+- 태그 경고: 문서 생성 시 태그 2개 미만이면 경고
+- 태그 자동추천: 불용어/복수형 정규화 + TF-IDF + 코사인 유사도 기반, 최대 10개
+
+## 저장 구조
+
+- `wiki.db`: 문서 메타/태그
+- `wiki_fts.db`: 본문 검색용 SQLite FTS5 전용 DB
+- `doc/*.md`: 문서 본문
+- `doc/*.json`: 문서 sidecar 메타
+- `img/`: 이미지 파일
 
 ## 실행
 
@@ -34,19 +47,7 @@ python app.py
 .\build.ps1
 ```
 
-PowerShell 실행 정책 때문에 막히면:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-```
-
-빌드 결과:
+실행 파일:
 
 - `dist/PersonalWiki/PersonalWiki.exe`
-- 단일 파일이 아닌 폴더(`onedir`) 형식
-
-## 검색 예시
-
-- `flask AND sqlite`
-- `python OR rust`
-- `template NOT draft`
+- 단일 파일이 아닌 폴더(onedir) 형식

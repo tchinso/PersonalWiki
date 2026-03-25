@@ -28,4 +28,31 @@
   </header>
   <article class="markdown-body">{{ rendered }}</article>
 </section>
+
+<section class="panel">
+  <h2>Backlinks</h2>
+  <p class="muted">이 문서를 링크하거나 템플릿으로 참조한 문서 목록입니다.</p>
+  {% if backlinks %}
+    <ul class="doc-list">
+      {% for item in backlinks %}
+        <li class="doc-item">
+          <div class="doc-head">
+            <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
+            <span class="doc-time">{{ item.updated_at|pretty_time }}</span>
+          </div>
+          <div class="tag-row">
+            {% if "link" in item.reasons %}
+              <span class="ref-kind">문서링크</span>
+            {% endif %}
+            {% if "template" in item.reasons %}
+              <span class="ref-kind template">템플릿참조</span>
+            {% endif %}
+          </div>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>아직 이 문서를 참조한 문서가 없습니다.</p>
+  {% endif %}
+</section>
 {% endblock %}

@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import json
+import math
 import re
 import sqlite3
 import sys
 import unicodedata
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
-import mistune
 from flask import (
     Flask,
     abort,
@@ -20,6 +22,8 @@ from flask import (
     url_for,
 )
 from markupsafe import Markup
+
+from markdown_engine import MarkdownEngine, extract_reference_targets
 
 
 def now_iso() -> str:
@@ -40,6 +44,7 @@ RESOURCE_DIR, DATA_DIR = runtime_paths()
 DOC_DIR = DATA_DIR / "doc"
 IMG_DIR = DATA_DIR / "img"
 DB_PATH = DATA_DIR / "wiki.db"
+FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 TEMPLATE_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
 
@@ -51,14 +56,77 @@ app = Flask(
 )
 app.config["JSON_AS_ASCII"] = False
 
-WIKI_LINK_RE = re.compile(r"(?<!\!)\[\[([^\[\]]+)\]\]")
-IMAGE_SHORTCUT_RE = re.compile(r"!\[\[([^\[\]]+)\]\]")
-TEMPLATE_RE = re.compile(r"\{\{([^{}]+)\}\}")
+markdown_engine = MarkdownEngine()
 
-markdown = mistune.create_markdown(
-    escape=False,
-    plugins=["strikethrough", "table", "task_lists", "url", "footnotes"],
-)
+TOKEN_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
+STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "not",
+    "with",
+    "from",
+    "into",
+    "about",
+    "that",
+    "this",
+    "there",
+    "their",
+    "your",
+    "you",
+    "for",
+    "are",
+    "was",
+    "were",
+    "been",
+    "will",
+    "shall",
+    "have",
+    "has",
+    "had",
+    "can",
+    "could",
+    "would",
+    "should",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "as",
+    "is",
+    "it",
+    "its",
+    "by",
+    "be",
+    "if",
+    "else",
+    "when",
+    "where",
+    "which",
+    "who",
+    "what",
+    "why",
+    "how",
+    "문서",
+    "내용",
+    "그리고",
+    "또는",
+    "에서",
+    "으로",
+    "입니다",
+    "있는",
+    "하는",
+    "합니다",
+    "대한",
+    "통해",
+    "관련",
+    "사용",
+    "기능",
+    "추가",
+}
 
 
 def connect_db() -> sqlite3.Connection:
@@ -68,10 +136,22 @@ def connect_db() -> sqlite3.Connection:
     return conn
 
 
+def connect_fts_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(FTS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = connect_db()
     return g.db
+
+
+def get_fts_db() -> sqlite3.Connection:
+    if "fts_db" not in g:
+        g.fts_db = connect_fts_db()
+    return g.fts_db
 
 
 @app.teardown_appcontext
@@ -79,6 +159,9 @@ def close_db(_error: BaseException | None) -> None:
     conn = g.pop("db", None)
     if conn is not None:
         conn.close()
+    fts_conn = g.pop("fts_db", None)
+    if fts_conn is not None:
+        fts_conn.close()
 
 
 def init_storage() -> None:
@@ -122,8 +205,12 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
+        # Legacy cleanup: older versions stored docs_fts in wiki.db.
+        conn.execute("DROP TABLE IF EXISTS docs_fts")
 
-        # FTS5 supports AND/OR/NOT search natively.
+
+def init_fts_db() -> None:
+    with connect_fts_db() as conn:
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts
@@ -174,6 +261,13 @@ def read_document(slug: str) -> str:
     path = document_path(slug)
     if not path.exists():
         return ""
+    return path.read_text(encoding="utf-8")
+
+
+def read_document_if_exists(slug: str) -> str | None:
+    path = document_path(slug)
+    if not path.exists():
+        return None
     return path.read_text(encoding="utf-8")
 
 
@@ -238,8 +332,6 @@ def parse_tags(raw: str) -> list[str]:
         tag = part.strip()
         if not tag:
             continue
-        if "," in tag:
-            continue
         lowered = tag.casefold()
         if lowered in seen:
             continue
@@ -258,16 +350,23 @@ def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None
                 "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
                 (doc_id, tag_row["id"]),
             )
-
     conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
 
 
-def update_fts(conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
-    conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
-    conn.execute(
+def update_fts(fts_conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
+    fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
+    fts_conn.execute(
         "INSERT INTO docs_fts (rowid, title, content) VALUES (?, ?, ?)",
         (doc_id, title, content),
     )
+
+
+def rebuild_fts_index(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
+    fts_conn.execute("DELETE FROM docs_fts")
+    for row in rows:
+        content = read_document(row["slug"])
+        update_fts(fts_conn, row["id"], row["title"], content)
 
 
 def infer_title_from_content(content: str, fallback: str) -> str:
@@ -300,60 +399,13 @@ def resolve_doc_reference(conn: sqlite3.Connection, ref: str) -> str | None:
     return None
 
 
-def expand_templates(conn: sqlite3.Connection, text: str, depth: int = 0, stack: set[str] | None = None) -> str:
-    if stack is None:
-        stack = set()
-    if depth > 8:
-        return f"{text}\n\n> [Template depth limit reached]"
-
-    def repl(match: re.Match[str]) -> str:
-        ref = match.group(1).strip()
-        slug = resolve_doc_reference(conn, ref)
-        if not slug:
-            return f"\n\n> [Missing template: {ref}]\n\n"
-        if slug in stack:
-            return f"\n\n> [Template loop detected: {ref}]\n\n"
-        path = document_path(slug)
-        if not path.exists():
-            return f"\n\n> [Missing template file: {ref}]\n\n"
-        template_content = path.read_text(encoding="utf-8")
-        return expand_templates(conn, template_content, depth + 1, stack | {slug})
-
-    return TEMPLATE_RE.sub(repl, text)
-
-
-def preprocess_markup(conn: sqlite3.Connection, text: str) -> str:
-    processed = expand_templates(conn, text)
-
-    def image_repl(match: re.Match[str]) -> str:
-        raw = match.group(1).strip()
-        if "|" in raw:
-            filename, alt = [part.strip() for part in raw.split("|", 1)]
-        else:
-            filename = raw
-            alt = Path(filename).stem or "image"
-        safe = quote(filename.replace("\\", "/"))
-        return f"![{alt}](/img/{safe})"
-
-    processed = IMAGE_SHORTCUT_RE.sub(image_repl, processed)
-
-    def link_repl(match: re.Match[str]) -> str:
-        raw = match.group(1).strip()
-        if "|" in raw:
-            target, label = [part.strip() for part in raw.split("|", 1)]
-        else:
-            target, label = raw, raw
-
-        slug = resolve_doc_reference(conn, target)
-        if slug:
-            return f"[{label}](/doc/{quote(slug)})"
-        return f"[{label}](/new?title={quote(target)})"
-
-    return WIKI_LINK_RE.sub(link_repl, processed)
-
-
 def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
-    return Markup(markdown(preprocess_markup(conn, text)))
+    html = markdown_engine.render(
+        text,
+        resolve_doc_reference=lambda ref: resolve_doc_reference(conn, ref),
+        read_document=read_document_if_exists,
+    )
+    return Markup(html)
 
 
 def normalize_search_query(query: str) -> str:
@@ -366,8 +418,175 @@ def normalize_search_query(query: str) -> str:
     return " ".join(query.split())
 
 
+def singularize_token(token: str) -> str:
+    if not token.isascii() or not token.isalpha():
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith(("sses", "xes", "zes", "ches", "shes")) and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and len(token) > 3 and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def tokenize_text(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw in TOKEN_RE.findall(text.lower()):
+        token = singularize_token(raw)
+        if token in STOPWORDS:
+            continue
+        if len(token) < 2:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def build_tfidf_vector(tf_counter: Counter[str], df_counter: Counter[str], total_docs: int) -> dict[str, float]:
+    if total_docs <= 0:
+        return {}
+    vec: dict[str, float] = {}
+    for token, tf in tf_counter.items():
+        if tf <= 0:
+            continue
+        df = df_counter.get(token, 0)
+        idf = math.log((total_docs + 1) / (df + 1)) + 1
+        vec[token] = float(tf) * idf
+    return vec
+
+
+def cosine_similarity(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    common = set(vec_a.keys()) & set(vec_b.keys())
+    if not common:
+        return 0.0
+    numerator = sum(vec_a[token] * vec_b[token] for token in common)
+    norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
+    norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return numerator / (norm_a * norm_b)
+
+
+def recommend_tags(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    content: str,
+    current_slug: str | None = None,
+    exclude_tags: list[str] | None = None,
+    limit: int = 10,
+) -> list[str]:
+    query_tokens = tokenize_text(f"{title}\n{content}")
+    if not query_tokens:
+        return []
+
+    rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
+    corpus: list[dict] = []
+    for row in rows:
+        if current_slug and row["slug"] == current_slug:
+            continue
+        doc_content = read_document(row["slug"])
+        doc_tokens = tokenize_text(f"{row['title']}\n{doc_content}")
+        if not doc_tokens:
+            continue
+        corpus.append(
+            {
+                "tokens": doc_tokens,
+                "tags": list_doc_tags(conn, row["id"]),
+            }
+        )
+    if not corpus:
+        return []
+
+    df_counter: Counter[str] = Counter()
+    for doc in corpus:
+        for token in set(doc["tokens"]):
+            df_counter[token] += 1
+
+    total_docs = len(corpus)
+    query_vec = build_tfidf_vector(Counter(query_tokens), df_counter, total_docs)
+    if not query_vec:
+        return []
+
+    scored_docs: list[tuple[float, list[str]]] = []
+    for doc in corpus:
+        doc_vec = build_tfidf_vector(Counter(doc["tokens"]), df_counter, total_docs)
+        similarity = cosine_similarity(query_vec, doc_vec)
+        if similarity > 0:
+            scored_docs.append((similarity, doc["tags"]))
+    if not scored_docs:
+        return []
+
+    scored_docs.sort(key=lambda item: item[0], reverse=True)
+    similar_docs = scored_docs[:30]
+
+    excluded = {tag.casefold() for tag in (exclude_tags or [])}
+    tag_counts: Counter[str] = Counter()
+    tag_weights: defaultdict[str, float] = defaultdict(float)
+    display_names: dict[str, str] = {}
+
+    for similarity, tags in similar_docs:
+        seen_in_doc: set[str] = set()
+        for tag in tags:
+            key = tag.casefold()
+            if key in excluded or key in seen_in_doc:
+                continue
+            seen_in_doc.add(key)
+            display_names.setdefault(key, tag)
+            tag_counts[key] += 1
+            tag_weights[key] += similarity
+
+    ordered = sorted(
+        tag_counts.keys(),
+        key=lambda key: (-tag_counts[key], -tag_weights[key], display_names[key].casefold()),
+    )
+    return [display_names[key] for key in ordered[:limit]]
+
+
+def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, title, slug, updated_at
+        FROM docs
+        WHERE slug != ?
+        ORDER BY updated_at DESC, title COLLATE NOCASE
+        """,
+        (target_slug,),
+    ).fetchall()
+
+    backlinks: list[dict] = []
+    for row in rows:
+        content = read_document(row["slug"])
+        wiki_refs, template_refs = extract_reference_targets(content)
+
+        has_link_reference = any(
+            resolve_doc_reference(conn, ref) == target_slug
+            for ref in wiki_refs
+        )
+        has_template_reference = any(
+            resolve_doc_reference(conn, ref) == target_slug
+            for ref in template_refs
+        )
+
+        if not has_link_reference and not has_template_reference:
+            continue
+
+        reasons: list[str] = []
+        if has_link_reference:
+            reasons.append("link")
+        if has_template_reference:
+            reasons.append("template")
+
+        item = dict(row)
+        item["reasons"] = reasons
+        backlinks.append(item)
+    return backlinks
+
+
 def sync_documents() -> None:
-    with connect_db() as conn:
+    with connect_db() as conn, connect_fts_db() as fts_conn:
         md_files = sorted(DOC_DIR.glob("*.md"))
         existing_rows = conn.execute("SELECT id, slug FROM docs").fetchall()
         existing_by_slug = {row["slug"]: row for row in existing_rows}
@@ -385,7 +604,7 @@ def sync_documents() -> None:
                 title = sidecar_title or infer_title_from_content(content, slug)
                 if not title:
                     title = slug
-                # If duplicate title appears from manual file copy, keep importing by suffixing.
+
                 unique_title = title
                 suffix = 2
                 while conn.execute(
@@ -428,22 +647,31 @@ def sync_documents() -> None:
                     tags=tags,
                     meta=meta,
                 )
-                update_fts(conn, doc_id, unique_title, content)
                 continue
 
             doc_id = row["id"]
-            title = conn.execute("SELECT title FROM docs WHERE id = ?", (doc_id,)).fetchone()["title"]
-            update_fts(conn, doc_id, title, content)
+            current_title_row = conn.execute("SELECT title FROM docs WHERE id = ?", (doc_id,)).fetchone()
+            current_title = current_title_row["title"] if current_title_row else slug
+            conn.execute(
+                "UPDATE docs SET file_path = ? WHERE id = ?",
+                (str(md_file), doc_id),
+            )
+            if not current_title:
+                conn.execute(
+                    "UPDATE docs SET title = ? WHERE id = ?",
+                    (infer_title_from_content(content, slug), doc_id),
+                )
 
         for row in existing_rows:
             if row["slug"] in seen_slugs:
                 continue
-            conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
             conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
+
+        rebuild_fts_index(conn, fts_conn)
 
 
 def ensure_default_home() -> None:
-    with connect_db() as conn:
+    with connect_db() as conn, connect_fts_db() as fts_conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"]
         if count > 0:
             return
@@ -457,12 +685,14 @@ def ensure_default_home() -> None:
 ## 기본 문법
 
 - 문서 링크: `[[문서명]]` 또는 `[[문서명|표시 텍스트]]`
-- 이미지 삽입: `![[샘플.png]]` (파일은 `/img` 폴더에 저장)
-- 템플릿 포함: `{{공통문서}}`
-- 태그는 편집 화면에서 콤마(`,`)로 구분해서 입력
+- 이미지 삽입: `![[sample.png]]`
+- 하이라이트: `==강조==`
+- 스포일러: `||숨김 텍스트||`
+- 유튜브 임베드: `![[youtube(HhnETSN6U_E)]]`
+- 템플릿 포함: `{{공통문서}}` (중첩 템플릿은 확장되지 않음)
+- 콜아웃: `!!! note 내용`, `!!! info 내용`, `!!! warn 내용`, `!!! danger 내용`
 
 ## 검색
-
 검색창에서 `AND`, `OR`, `NOT` 연산자를 지원합니다.
 예: `flask AND sqlite`, `python NOT django`
 """
@@ -486,7 +716,7 @@ def ensure_default_home() -> None:
         tags = ["guide", "start"]
         write_document(slug, content)
         set_doc_tags(conn, doc_id, tags)
-        update_fts(conn, doc_id, title, content)
+        update_fts(fts_conn, doc_id, title, content)
         write_sidecar(
             slug=slug,
             title=title,
@@ -548,21 +778,33 @@ def view_doc(slug: str):
 
     content = read_document(doc["slug"])
     rendered = render_markdown(conn, content)
+    backlinks = find_backlinks(conn, doc["slug"])
     return render_template(
         "view.html",
         doc=doc,
         content=content,
         rendered=rendered,
+        backlinks=backlinks,
     )
 
 
 @app.route("/new", methods=["GET", "POST"])
 def new_doc():
     conn = get_db()
+    fts_conn = get_fts_db()
+
     if request.method == "POST":
         title = request.form.get("title", "").strip()
         content = request.form.get("content", "")
         tags = parse_tags(request.form.get("tags", ""))
+        ignore_tag_warning = request.form.get("ignore_tag_warning") == "1"
+        suggested_tags = recommend_tags(
+            conn,
+            title=title,
+            content=content,
+            exclude_tags=tags,
+            limit=10,
+        )
 
         if not title:
             return render_template(
@@ -572,6 +814,9 @@ def new_doc():
                 content=content,
                 tags_text=", ".join(tags),
                 error="문서 제목을 입력해 주세요.",
+                tag_warning=None,
+                show_ignore_tag_warning=False,
+                recommended_tags=suggested_tags,
             )
 
         duplicate = conn.execute(
@@ -586,39 +831,61 @@ def new_doc():
                 content=content,
                 tags_text=", ".join(tags),
                 error="같은 제목의 문서가 이미 있습니다.",
+                tag_warning=None,
+                show_ignore_tag_warning=False,
+                recommended_tags=suggested_tags,
+            )
+
+        if len(tags) < 2 and not ignore_tag_warning:
+            return render_template(
+                "edit.html",
+                mode="new",
+                doc={"title": title, "slug": ""},
+                content=content,
+                tags_text=", ".join(tags),
+                error=None,
+                tag_warning="태그를 2개 이상 등록하면 나중에 검색이 더 쉬워집니다. 계속 생성하려면 아래 버튼을 눌러 주세요.",
+                show_ignore_tag_warning=True,
+                recommended_tags=suggested_tags,
             )
 
         slug = ensure_unique_slug(conn, slugify(title))
         created_at = now_iso()
         meta = {"sidecar": f"{slug}.json"}
-        conn.execute(
-            """
-            INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                title,
-                slug,
-                str(document_path(slug)),
-                json.dumps(meta, ensure_ascii=False),
-                created_at,
-                created_at,
-            ),
-        )
-        doc_id = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"]
+        try:
+            conn.execute(
+                """
+                INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    title,
+                    slug,
+                    str(document_path(slug)),
+                    json.dumps(meta, ensure_ascii=False),
+                    created_at,
+                    created_at,
+                ),
+            )
+            doc_id = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"]
 
-        write_document(slug, content)
-        set_doc_tags(conn, doc_id, tags)
-        update_fts(conn, doc_id, title, content)
-        write_sidecar(
-            slug=slug,
-            title=title,
-            created_at=created_at,
-            updated_at=created_at,
-            tags=tags,
-            meta=meta,
-        )
-        conn.commit()
+            write_document(slug, content)
+            set_doc_tags(conn, doc_id, tags)
+            update_fts(fts_conn, doc_id, title, content)
+            write_sidecar(
+                slug=slug,
+                title=title,
+                created_at=created_at,
+                updated_at=created_at,
+                tags=tags,
+                meta=meta,
+            )
+            conn.commit()
+            fts_conn.commit()
+        except Exception:
+            conn.rollback()
+            fts_conn.rollback()
+            raise
         return redirect(url_for("view_doc", slug=slug))
 
     prefilled_title = request.args.get("title", "").strip()
@@ -629,12 +896,16 @@ def new_doc():
         content="",
         tags_text="",
         error=None,
+        tag_warning=None,
+        show_ignore_tag_warning=False,
+        recommended_tags=[],
     )
 
 
 @app.route("/edit/<path:slug>", methods=["GET", "POST"])
 def edit_doc(slug: str):
     conn = get_db()
+    fts_conn = get_fts_db()
     row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         abort(404)
@@ -647,6 +918,14 @@ def edit_doc(slug: str):
         new_title = request.form.get("title", "").strip()
         new_content = request.form.get("content", "")
         new_tags = parse_tags(request.form.get("tags", ""))
+        suggested_tags = recommend_tags(
+            conn,
+            title=new_title or row["title"],
+            content=new_content,
+            current_slug=row["slug"],
+            exclude_tags=new_tags,
+            limit=10,
+        )
 
         if not new_title:
             return render_template(
@@ -656,6 +935,9 @@ def edit_doc(slug: str):
                 content=new_content,
                 tags_text=", ".join(new_tags),
                 error="문서 제목을 입력해 주세요.",
+                tag_warning=None,
+                show_ignore_tag_warning=False,
+                recommended_tags=suggested_tags,
             )
 
         duplicate = conn.execute(
@@ -670,6 +952,9 @@ def edit_doc(slug: str):
                 content=new_content,
                 tags_text=", ".join(new_tags),
                 error="같은 제목의 문서가 이미 있습니다.",
+                tag_warning=None,
+                show_ignore_tag_warning=False,
+                recommended_tags=suggested_tags,
             )
 
         new_slug_candidate = slugify(new_title)
@@ -689,33 +974,39 @@ def edit_doc(slug: str):
         updated_at = now_iso()
         meta = safe_load_json(row["meta_json"])
         meta["sidecar"] = f"{new_slug}.json"
-        conn.execute(
-            """
-            UPDATE docs
-            SET title = ?, slug = ?, file_path = ?, meta_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                new_title,
-                new_slug,
-                str(document_path(new_slug)),
-                json.dumps(meta, ensure_ascii=False),
-                updated_at,
-                row["id"],
-            ),
-        )
-        write_document(new_slug, new_content)
-        set_doc_tags(conn, row["id"], new_tags)
-        update_fts(conn, row["id"], new_title, new_content)
-        write_sidecar(
-            slug=new_slug,
-            title=new_title,
-            created_at=row["created_at"],
-            updated_at=updated_at,
-            tags=new_tags,
-            meta=meta,
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                """
+                UPDATE docs
+                SET title = ?, slug = ?, file_path = ?, meta_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_title,
+                    new_slug,
+                    str(document_path(new_slug)),
+                    json.dumps(meta, ensure_ascii=False),
+                    updated_at,
+                    row["id"],
+                ),
+            )
+            write_document(new_slug, new_content)
+            set_doc_tags(conn, row["id"], new_tags)
+            update_fts(fts_conn, row["id"], new_title, new_content)
+            write_sidecar(
+                slug=new_slug,
+                title=new_title,
+                created_at=row["created_at"],
+                updated_at=updated_at,
+                tags=new_tags,
+                meta=meta,
+            )
+            conn.commit()
+            fts_conn.commit()
+        except Exception:
+            conn.rollback()
+            fts_conn.rollback()
+            raise
         return redirect(url_for("view_doc", slug=new_slug))
 
     doc["tags"] = tags
@@ -726,19 +1017,36 @@ def edit_doc(slug: str):
         content=current_content,
         tags_text=", ".join(tags),
         error=None,
+        tag_warning=None,
+        show_ignore_tag_warning=False,
+        recommended_tags=recommend_tags(
+            conn,
+            title=doc["title"],
+            content=current_content,
+            current_slug=doc["slug"],
+            exclude_tags=tags,
+            limit=10,
+        ),
     )
 
 
 @app.post("/delete/<path:slug>")
 def delete_doc(slug: str):
     conn = get_db()
+    fts_conn = get_fts_db()
     row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         abort(404)
 
-    conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
-    conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
-    conn.commit()
+    try:
+        fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
+        conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
+        conn.commit()
+        fts_conn.commit()
+    except Exception:
+        conn.rollback()
+        fts_conn.rollback()
+        raise
 
     md = document_path(slug)
     side = sidecar_path(slug)
@@ -771,6 +1079,7 @@ def docs_by_tag(tag_name: str):
 @app.route("/search")
 def search():
     conn = get_db()
+    fts_conn = get_fts_db()
     query = request.args.get("q", "").strip()
     results: list[dict] = []
     error: str | None = None
@@ -778,21 +1087,41 @@ def search():
     if query:
         normalized = normalize_search_query(query)
         try:
-            rows = conn.execute(
+            fts_rows = fts_conn.execute(
                 """
                 SELECT
-                    d.title,
-                    d.slug,
+                    rowid AS doc_id,
                     snippet(docs_fts, 1, '<mark>', '</mark>', ' ... ', 24) AS excerpt
                 FROM docs_fts
-                JOIN docs d ON d.id = docs_fts.rowid
                 WHERE docs_fts MATCH ?
-                ORDER BY bm25(docs_fts), d.updated_at DESC
+                ORDER BY bm25(docs_fts)
                 LIMIT 200
                 """,
                 (normalized,),
             ).fetchall()
-            results = [dict(row) for row in rows]
+
+            doc_ids = [int(row["doc_id"]) for row in fts_rows]
+            docs_by_id: dict[int, sqlite3.Row] = {}
+            if doc_ids:
+                placeholders = ",".join("?" for _ in doc_ids)
+                meta_rows = conn.execute(
+                    f"SELECT id, title, slug, updated_at FROM docs WHERE id IN ({placeholders})",
+                    doc_ids,
+                ).fetchall()
+                docs_by_id = {int(row["id"]): row for row in meta_rows}
+
+            for row in fts_rows:
+                doc_id = int(row["doc_id"])
+                doc_meta = docs_by_id.get(doc_id)
+                if not doc_meta:
+                    continue
+                results.append(
+                    {
+                        "title": doc_meta["title"],
+                        "slug": doc_meta["slug"],
+                        "excerpt": row["excerpt"],
+                    }
+                )
         except sqlite3.OperationalError:
             error = "검색식이 올바르지 않습니다. 예: flask AND sqlite, python NOT django"
 
@@ -813,6 +1142,32 @@ def preview():
     return jsonify({"html": str(html)})
 
 
+@app.post("/api/tag-suggestions")
+def tag_suggestions():
+    conn = get_db()
+    payload = request.get_json(silent=True) or {}
+
+    title = str(payload.get("title", "")).strip()
+    content = str(payload.get("content", ""))
+    current_slug = str(payload.get("slug", "")).strip() or None
+
+    raw_tags = payload.get("tags", "")
+    if isinstance(raw_tags, list):
+        tags = parse_tags(",".join(str(item) for item in raw_tags))
+    else:
+        tags = parse_tags(str(raw_tags))
+
+    suggestions = recommend_tags(
+        conn,
+        title=title,
+        content=content,
+        current_slug=current_slug,
+        exclude_tags=tags,
+        limit=10,
+    )
+    return jsonify({"tags": suggestions})
+
+
 @app.route("/img/<path:filename>")
 def serve_image(filename: str):
     return send_from_directory(IMG_DIR, filename)
@@ -821,6 +1176,7 @@ def serve_image(filename: str):
 def bootstrap() -> None:
     init_storage()
     init_db()
+    init_fts_db()
     sync_documents()
     ensure_default_home()
 

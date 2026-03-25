@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}Personal Wiki{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="{{ url_for('static', filename='wiki.js') }}" defer></script>
+    {% block extra_head %}{% endblock %}
   </head>
   <body>
     <header class="topbar">
@@ -29,5 +31,6 @@
     <main class="container">
       {% block content %}{% endblock %}
     </main>
+    {% block extra_scripts %}{% endblock %}
   </body>
 </html>
