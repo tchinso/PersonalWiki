@@ -9,6 +9,23 @@
   const currentSlug = editForm ? editForm.dataset.currentSlug || "" : "";
 
   let previewTimer = null;
+  let initialSnapshot = "";
+  let isSubmitting = false;
+
+  function buildSnapshot() {
+    return JSON.stringify({
+      title: titleInput ? titleInput.value : "",
+      tags: tagsInput ? tagsInput.value : "",
+      content: textarea ? textarea.value : "",
+    });
+  }
+
+  function hasUnsavedChanges() {
+    if (!editForm || isSubmitting) {
+      return false;
+    }
+    return buildSnapshot() !== initialSnapshot;
+  }
 
   function parseTags(raw) {
     const items = raw
@@ -129,6 +146,22 @@
       previewTimer = setTimeout(renderPreview, 200);
     });
     renderPreview();
+  }
+
+  if (editForm) {
+    initialSnapshot = buildSnapshot();
+
+    editForm.addEventListener("submit", () => {
+      isSubmitting = true;
+    });
+
+    window.addEventListener("beforeunload", (event) => {
+      if (!hasUnsavedChanges()) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    });
   }
 
   if (suggestButton) {
