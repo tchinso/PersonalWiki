@@ -8,5 +8,11 @@
   ],
   "meta": {
     "sidecar": "templateouter.json"
+  },
+  "references": {
+    "links": [],
+    "templates": [
+      "TemplateInner"
+    ]
   }
 }

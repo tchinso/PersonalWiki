@@ -203,8 +203,24 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS doc_references (
+                source_doc_id INTEGER NOT NULL,
+                ref_type TEXT NOT NULL CHECK (ref_type IN ('link', 'template')),
+                raw_target TEXT NOT NULL,
+                target_title_key TEXT NOT NULL,
+                target_slug_key TEXT NOT NULL,
+                PRIMARY KEY (source_doc_id, ref_type, raw_target),
+                FOREIGN KEY (source_doc_id) REFERENCES docs (id) ON DELETE CASCADE
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
         # Legacy cleanup: older versions stored docs_fts in wiki.db.
         conn.execute("DROP TABLE IF EXISTS docs_fts")
 
@@ -303,6 +319,54 @@ def load_sidecar(slug: str) -> dict:
     return {}
 
 
+def normalize_reference_target(value: str) -> str:
+    return unicodedata.normalize("NFKC", str(value)).strip()
+
+
+def dedupe_reference_targets(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        target = normalize_reference_target(raw)
+        if not target:
+            continue
+        key = target.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(target)
+    return result
+
+
+def extract_reference_payload(content: str) -> dict[str, list[str]]:
+    wiki_refs, template_refs = extract_reference_targets(content)
+    return {
+        "links": dedupe_reference_targets(wiki_refs),
+        "templates": dedupe_reference_targets(template_refs),
+    }
+
+
+def normalize_reference_payload(references: dict | None) -> dict[str, list[str]]:
+    if not isinstance(references, dict):
+        return {"links": [], "templates": []}
+
+    links_raw = references.get("links")
+    templates_raw = references.get("templates")
+
+    links = dedupe_reference_targets([str(item) for item in links_raw]) if isinstance(links_raw, list) else []
+    templates = (
+        dedupe_reference_targets([str(item) for item in templates_raw]) if isinstance(templates_raw, list) else []
+    )
+    return {
+        "links": links,
+        "templates": templates,
+    }
+
+
+def reference_title_key(value: str) -> str:
+    return normalize_reference_target(value).casefold()
+
+
 def write_sidecar(
     *,
     slug: str,
@@ -311,7 +375,9 @@ def write_sidecar(
     updated_at: str,
     tags: list[str],
     meta: dict,
+    references: dict | None = None,
 ) -> None:
+    normalized_references = normalize_reference_payload(references)
     payload = {
         "title": title,
         "slug": slug,
@@ -319,6 +385,7 @@ def write_sidecar(
         "updated_at": updated_at,
         "tags": tags,
         "meta": meta,
+        "references": normalized_references,
     }
     sidecar_path(slug).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -367,6 +434,28 @@ def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None
                 (doc_id, tag_row["id"]),
             )
     conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
+
+
+def set_doc_references(conn: sqlite3.Connection, doc_id: int, references: dict[str, list[str]]) -> None:
+    payload = normalize_reference_payload(references)
+    conn.execute("DELETE FROM doc_references WHERE source_doc_id = ?", (doc_id,))
+
+    for ref_type, key in (("link", "links"), ("template", "templates")):
+        for raw_target in payload[key]:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO doc_references
+                (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_id,
+                    ref_type,
+                    raw_target,
+                    reference_title_key(raw_target),
+                    slugify(raw_target),
+                ),
+            )
 
 
 def update_fts(fts_conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
@@ -562,40 +651,43 @@ def recommend_tags(
 
 
 def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
+    target_row = conn.execute("SELECT title, slug FROM docs WHERE slug = ?", (target_slug,)).fetchone()
+    if target_row is None:
+        return []
+
+    title_key = reference_title_key(target_row["title"])
+    slug_key = str(target_row["slug"])
+
     rows = conn.execute(
         """
-        SELECT id, title, slug, updated_at
-        FROM docs
-        WHERE slug != ?
-        ORDER BY updated_at DESC, title COLLATE NOCASE
+        SELECT
+            d.id,
+            d.title,
+            d.slug,
+            d.updated_at,
+            MAX(CASE WHEN r.ref_type = 'link' THEN 1 ELSE 0 END) AS has_link,
+            MAX(CASE WHEN r.ref_type = 'template' THEN 1 ELSE 0 END) AS has_template
+        FROM doc_references r
+        JOIN docs d ON d.id = r.source_doc_id
+        WHERE d.slug != ?
+          AND (r.target_title_key = ? OR r.target_slug_key = ?)
+        GROUP BY d.id, d.title, d.slug, d.updated_at
+        ORDER BY d.updated_at DESC, d.title COLLATE NOCASE
         """,
-        (target_slug,),
+        (target_slug, title_key, slug_key),
     ).fetchall()
 
     backlinks: list[dict] = []
     for row in rows:
-        content = read_document(row["slug"])
-        wiki_refs, template_refs = extract_reference_targets(content)
-
-        has_link_reference = any(
-            resolve_doc_reference(conn, ref) == target_slug
-            for ref in wiki_refs
-        )
-        has_template_reference = any(
-            resolve_doc_reference(conn, ref) == target_slug
-            for ref in template_refs
-        )
-
-        if not has_link_reference and not has_template_reference:
-            continue
-
         reasons: list[str] = []
-        if has_link_reference:
+        if row["has_link"]:
             reasons.append("link")
-        if has_template_reference:
+        if row["has_template"]:
             reasons.append("template")
 
         item = dict(row)
+        item.pop("has_link", None)
+        item.pop("has_template", None)
         item["reasons"] = reasons
         backlinks.append(item)
     return backlinks
@@ -604,7 +696,9 @@ def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
 def sync_documents() -> None:
     with connect_db() as conn, connect_fts_db() as fts_conn:
         md_files = sorted(DOC_DIR.glob("*.md"))
-        existing_rows = conn.execute("SELECT id, slug FROM docs").fetchall()
+        existing_rows = conn.execute(
+            "SELECT id, slug, title, created_at, updated_at, meta_json FROM docs"
+        ).fetchall()
         existing_by_slug = {row["slug"]: row for row in existing_rows}
         seen_slugs: set[str] = set()
 
@@ -612,6 +706,7 @@ def sync_documents() -> None:
             slug = md_file.stem
             seen_slugs.add(slug)
             content = read_text_normalized(md_file)
+            references = extract_reference_payload(content)
             row = existing_by_slug.get(slug)
 
             if row is None:
@@ -655,6 +750,7 @@ def sync_documents() -> None:
                 sidecar_tags = sidecar.get("tags") if isinstance(sidecar.get("tags"), list) else []
                 tags = [str(t).strip() for t in sidecar_tags if str(t).strip()]
                 set_doc_tags(conn, doc_id, tags)
+                set_doc_references(conn, doc_id, references)
                 write_sidecar(
                     slug=slug,
                     title=unique_title,
@@ -662,21 +758,37 @@ def sync_documents() -> None:
                     updated_at=updated_at,
                     tags=tags,
                     meta=meta,
+                    references=references,
                 )
                 continue
 
             doc_id = row["id"]
-            current_title_row = conn.execute("SELECT title FROM docs WHERE id = ?", (doc_id,)).fetchone()
-            current_title = current_title_row["title"] if current_title_row else slug
-            conn.execute(
-                "UPDATE docs SET file_path = ? WHERE id = ?",
-                (str(md_file), doc_id),
-            )
+            current_title = str(row["title"] or "").strip()
             if not current_title:
+                current_title = infer_title_from_content(content, slug) or slug
                 conn.execute(
                     "UPDATE docs SET title = ? WHERE id = ?",
-                    (infer_title_from_content(content, slug), doc_id),
+                    (current_title, doc_id),
                 )
+
+            meta = safe_load_json(row["meta_json"])
+            meta["sidecar"] = f"{slug}.json"
+            conn.execute(
+                "UPDATE docs SET file_path = ?, meta_json = ? WHERE id = ?",
+                (str(md_file), json.dumps(meta, ensure_ascii=False), doc_id),
+            )
+
+            tags = list_doc_tags(conn, doc_id)
+            set_doc_references(conn, doc_id, references)
+            write_sidecar(
+                slug=slug,
+                title=current_title,
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                tags=tags,
+                meta=meta,
+                references=references,
+            )
 
         for row in existing_rows:
             if row["slug"] in seen_slugs:
@@ -730,8 +842,10 @@ def ensure_default_home() -> None:
         )
         doc_id = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"]
         tags = ["guide", "start"]
+        references = extract_reference_payload(content)
         write_document(slug, content)
         set_doc_tags(conn, doc_id, tags)
+        set_doc_references(conn, doc_id, references)
         update_fts(fts_conn, doc_id, title, content)
         write_sidecar(
             slug=slug,
@@ -740,6 +854,7 @@ def ensure_default_home() -> None:
             updated_at=now,
             tags=tags,
             meta=meta,
+            references=references,
         )
 
 
@@ -885,8 +1000,10 @@ def new_doc():
             )
             doc_id = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"]
 
+            references = extract_reference_payload(content)
             write_document(slug, content)
             set_doc_tags(conn, doc_id, tags)
+            set_doc_references(conn, doc_id, references)
             update_fts(fts_conn, doc_id, title, content)
             write_sidecar(
                 slug=slug,
@@ -895,6 +1012,7 @@ def new_doc():
                 updated_at=created_at,
                 tags=tags,
                 meta=meta,
+                references=references,
             )
             conn.commit()
             fts_conn.commit()
@@ -1006,8 +1124,10 @@ def edit_doc(slug: str):
                     row["id"],
                 ),
             )
+            references = extract_reference_payload(new_content)
             write_document(new_slug, new_content)
             set_doc_tags(conn, row["id"], new_tags)
+            set_doc_references(conn, row["id"], references)
             update_fts(fts_conn, row["id"], new_title, new_content)
             write_sidecar(
                 slug=new_slug,
@@ -1016,6 +1136,7 @@ def edit_doc(slug: str):
                 updated_at=updated_at,
                 tags=new_tags,
                 meta=meta,
+                references=references,
             )
             conn.commit()
             fts_conn.commit()

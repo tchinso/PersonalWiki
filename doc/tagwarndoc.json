@@ -8,5 +8,9 @@
   ],
   "meta": {
     "sidecar": "tagwarndoc.json"
+  },
+  "references": {
+    "links": [],
+    "templates": []
   }
 }

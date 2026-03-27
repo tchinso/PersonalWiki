@@ -9,5 +9,13 @@
   ],
   "meta": {
     "sidecar": "home.json"
+  },
+  "references": {
+    "links": [
+      "문서명"
+    ],
+    "templates": [
+      "공통문서"
+    ]
   }
 }

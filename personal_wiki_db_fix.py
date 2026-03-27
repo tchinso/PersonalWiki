@@ -4,8 +4,11 @@ import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from datetime import datetime
 from pathlib import Path
+
+from markdown_engine import extract_reference_targets
 
 
 def runtime_data_dir() -> Path:
@@ -86,6 +89,61 @@ def ensure_unique_title(conn: sqlite3.Connection, title: str) -> str:
     return candidate
 
 
+def slugify(title: str) -> str:
+    normalized = unicodedata.normalize("NFKC", title).strip()
+    normalized = re.sub(r"[^\w\s\-가-힣]", "", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"[\s_]+", "-", normalized, flags=re.UNICODE)
+    slug = normalized.strip("-").lower()
+    return slug or "untitled"
+
+
+def normalize_reference_target(value: str) -> str:
+    return unicodedata.normalize("NFKC", str(value)).strip()
+
+
+def dedupe_reference_targets(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        target = normalize_reference_target(raw)
+        if not target:
+            continue
+        key = target.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(target)
+    return result
+
+
+def extract_reference_payload(content: str) -> dict[str, list[str]]:
+    wiki_refs, template_refs = extract_reference_targets(content)
+    return {
+        "links": dedupe_reference_targets(wiki_refs),
+        "templates": dedupe_reference_targets(template_refs),
+    }
+
+
+def normalize_reference_payload(references: dict | None) -> dict[str, list[str]]:
+    if not isinstance(references, dict):
+        return {"links": [], "templates": []}
+
+    links_raw = references.get("links")
+    templates_raw = references.get("templates")
+    links = dedupe_reference_targets([str(item) for item in links_raw]) if isinstance(links_raw, list) else []
+    templates = (
+        dedupe_reference_targets([str(item) for item in templates_raw]) if isinstance(templates_raw, list) else []
+    )
+    return {
+        "links": links,
+        "templates": templates,
+    }
+
+
+def reference_title_key(value: str) -> str:
+    return normalize_reference_target(value).casefold()
+
+
 def connect_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -126,8 +184,24 @@ def init_main_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS doc_references (
+            source_doc_id INTEGER NOT NULL,
+            ref_type TEXT NOT NULL CHECK (ref_type IN ('link', 'template')),
+            raw_target TEXT NOT NULL,
+            target_title_key TEXT NOT NULL,
+            target_slug_key TEXT NOT NULL,
+            PRIMARY KEY (source_doc_id, ref_type, raw_target),
+            FOREIGN KEY (source_doc_id) REFERENCES docs (id) ON DELETE CASCADE
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
     conn.execute("DROP TABLE IF EXISTS docs_fts")
 
 
@@ -154,11 +228,60 @@ def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None
     conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
 
 
+def set_doc_references(conn: sqlite3.Connection, doc_id: int, references: dict[str, list[str]]) -> None:
+    payload = normalize_reference_payload(references)
+    conn.execute("DELETE FROM doc_references WHERE source_doc_id = ?", (doc_id,))
+
+    for ref_type, key in (("link", "links"), ("template", "templates")):
+        for raw_target in payload[key]:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO doc_references
+                (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_id,
+                    ref_type,
+                    raw_target,
+                    reference_title_key(raw_target),
+                    slugify(raw_target),
+                ),
+            )
+
+
 def update_fts(conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
     conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
     conn.execute(
         "INSERT INTO docs_fts (rowid, title, content) VALUES (?, ?, ?)",
         (doc_id, title, content),
+    )
+
+
+def write_sidecar(
+    *,
+    slug: str,
+    title: str,
+    created_at: str,
+    updated_at: str,
+    tags: list[str],
+    meta: dict,
+    references: dict[str, list[str]],
+) -> None:
+    payload = {
+        "title": title,
+        "slug": slug,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "tags": tags,
+        "meta": meta,
+        "references": normalize_reference_payload(references),
+    }
+    sidecar_path = DOC_DIR / f"{slug}.json"
+    sidecar_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="\n",
     )
 
 
@@ -197,7 +320,6 @@ def recreate_databases() -> tuple[int, int]:
                     main_conn,
                     str(sidecar.get("title", "")).strip() or infer_title_from_content(content, slug) or slug,
                 )
-
                 created_at = str(sidecar.get("created_at") or now_iso())
                 updated_at = str(sidecar.get("updated_at") or created_at)
 
@@ -225,8 +347,20 @@ def recreate_databases() -> tuple[int, int]:
 
                 doc_id = int(row["id"])
                 tags = collect_tags(sidecar)
+                references = extract_reference_payload(content)
+
                 set_doc_tags(main_conn, doc_id, tags)
+                set_doc_references(main_conn, doc_id, references)
                 update_fts(fts_conn, doc_id, title, content)
+                write_sidecar(
+                    slug=slug,
+                    title=title,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    tags=tags,
+                    meta=meta_dict,
+                    references=references,
+                )
                 imported += 1
             except Exception as error:
                 skipped += 1
@@ -252,6 +386,7 @@ def main() -> int:
         return 1
 
     print(f"[OK] Recreated databases from /doc: imported={imported}, skipped={skipped}")
+    print("[OK] Sidecar JSON files now include backlink reference cache.")
     return 0
 
 
