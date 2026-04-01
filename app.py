@@ -4,6 +4,7 @@ import json
 import math
 import re
 import sqlite3
+import subprocess
 import sys
 import unicodedata
 from collections import Counter, defaultdict
@@ -129,6 +130,15 @@ STOPWORDS = {
 }
 
 
+DIRTY_MTIME_GRACE_SECONDS = 1.0
+SEVERE_DIFF_MIN_CHANGES = 300
+SEVERE_DIFF_RATIO = 0.9
+
+
+class StartupRecoveryNeeded(RuntimeError):
+    pass
+
+
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -251,6 +261,24 @@ def slugify(title: str) -> str:
     normalized = re.sub(r"[\s_]+", "-", normalized, flags=re.UNICODE)
     slug = normalized.strip("-").lower()
     return slug or "untitled"
+
+
+def ensure_unique_title(conn: sqlite3.Connection, base_title: str, exclude_doc_id: int | None = None) -> str:
+    title = base_title.strip() or "untitled"
+    candidate = title
+    suffix = 2
+    while True:
+        if exclude_doc_id is None:
+            row = conn.execute("SELECT id FROM docs WHERE title = ? COLLATE NOCASE", (candidate,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM docs WHERE title = ? COLLATE NOCASE AND id != ?",
+                (candidate, exclude_doc_id),
+            ).fetchone()
+        if row is None:
+            return candidate
+        candidate = f"{title} ({suffix})"
+        suffix += 1
 
 
 def ensure_unique_slug(conn: sqlite3.Connection, base_slug: str, exclude_doc_id: int | None = None) -> str:
@@ -464,15 +492,6 @@ def update_fts(fts_conn: sqlite3.Connection, doc_id: int, title: str, content: s
         "INSERT INTO docs_fts (rowid, title, content) VALUES (?, ?, ?)",
         (doc_id, title, content),
     )
-
-
-def rebuild_fts_index(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> None:
-    rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
-    fts_conn.execute("DELETE FROM docs_fts")
-    for row in rows:
-        content = read_document(row["slug"])
-        update_fts(fts_conn, row["id"], row["title"], content)
-
 
 def infer_title_from_content(content: str, fallback: str) -> str:
     match = re.search(r"^\s*#\s+(.+)$", content, flags=re.MULTILINE)
@@ -693,109 +712,316 @@ def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
     return backlinks
 
 
-def sync_documents() -> None:
+def iso_from_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def timestamp_from_iso(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def build_markdown_snapshot() -> dict[str, dict[str, object]]:
+    snapshot: dict[str, dict[str, object]] = {}
+    for md_file in sorted(DOC_DIR.glob("*.md")):
+        try:
+            mtime = float(md_file.stat().st_mtime)
+        except OSError:
+            continue
+        snapshot[md_file.stem] = {
+            "path": md_file,
+            "mtime": mtime,
+        }
+    return snapshot
+
+
+def build_db_snapshot(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    rows = conn.execute("SELECT id, slug, title, created_at, updated_at, meta_json FROM docs").fetchall()
+    return {row["slug"]: row for row in rows}
+
+
+def is_severe_divergence(*, md_count: int, db_count: int, total_changes: int) -> bool:
+    if total_changes < SEVERE_DIFF_MIN_CHANGES:
+        return False
+    baseline = max(md_count, db_count, 1)
+    return (total_changes / baseline) >= SEVERE_DIFF_RATIO
+
+
+def sync_new_doc(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    *,
+    slug: str,
+    md_file: Path,
+    mtime: float,
+) -> None:
+    content = read_text_normalized(md_file)
+    references = extract_reference_payload(content)
+    sidecar = load_sidecar(slug)
+
+    sidecar_title = str(sidecar.get("title", "")).strip()
+    title_candidate = sidecar_title or infer_title_from_content(content, slug) or slug
+    title = ensure_unique_title(conn, title_candidate)
+
+    created_at_raw = str(sidecar.get("created_at") or "").strip()
+    created_at = created_at_raw or iso_from_timestamp(mtime)
+    updated_at = iso_from_timestamp(mtime)
+
+    meta_value = sidecar.get("meta")
+    meta = meta_value if isinstance(meta_value, dict) else {}
+    meta["sidecar"] = f"{slug}.json"
+
+    conn.execute(
+        """
+        INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            title,
+            slug,
+            str(md_file),
+            json.dumps(meta, ensure_ascii=False),
+            created_at,
+            updated_at,
+        ),
+    )
+    doc_row = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()
+    if doc_row is None:
+        raise RuntimeError(f"failed to create doc row for slug '{slug}'")
+    doc_id = int(doc_row["id"])
+
+    tags_value = sidecar.get("tags")
+    if isinstance(tags_value, list):
+        tags = parse_tags(",".join(str(item) for item in tags_value))
+    elif isinstance(tags_value, str):
+        tags = parse_tags(tags_value)
+    else:
+        tags = []
+
+    set_doc_tags(conn, doc_id, tags)
+    set_doc_references(conn, doc_id, references)
+    update_fts(fts_conn, doc_id, title, content)
+    write_sidecar(
+        slug=slug,
+        title=title,
+        created_at=created_at,
+        updated_at=updated_at,
+        tags=tags,
+        meta=meta,
+        references=references,
+    )
+
+
+def sync_modified_doc(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+    md_file: Path,
+    mtime: float,
+) -> None:
+    slug = str(row["slug"])
+    doc_id = int(row["id"])
+    content = read_text_normalized(md_file)
+    references = extract_reference_payload(content)
+
+    current_title = str(row["title"] or "").strip()
+    if not current_title:
+        inferred = infer_title_from_content(content, slug) or slug
+        current_title = ensure_unique_title(conn, inferred, exclude_doc_id=doc_id)
+
+    meta = safe_load_json(row["meta_json"])
+    meta["sidecar"] = f"{slug}.json"
+    updated_at = iso_from_timestamp(mtime)
+
+    conn.execute(
+        """
+        UPDATE docs
+        SET title = ?, file_path = ?, meta_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            current_title,
+            str(md_file),
+            json.dumps(meta, ensure_ascii=False),
+            updated_at,
+            doc_id,
+        ),
+    )
+    tags = list_doc_tags(conn, doc_id)
+    set_doc_references(conn, doc_id, references)
+    update_fts(fts_conn, doc_id, current_title, content)
+    write_sidecar(
+        slug=slug,
+        title=current_title,
+        created_at=row["created_at"],
+        updated_at=updated_at,
+        tags=tags,
+        meta=meta,
+        references=references,
+    )
+
+
+def sync_deleted_doc(conn: sqlite3.Connection, fts_conn: sqlite3.Connection, *, row: sqlite3.Row) -> None:
+    doc_id = int(row["id"])
+    fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
+    conn.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
+
+
+def repair_fts_mismatch(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> tuple[int, int]:
+    doc_rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
+    fts_rows = fts_conn.execute("SELECT rowid FROM docs_fts").fetchall()
+
+    docs_by_id = {int(row["id"]): row for row in doc_rows}
+    doc_ids = set(docs_by_id.keys())
+    fts_ids = {int(row["rowid"]) for row in fts_rows}
+
+    missing_ids = sorted(doc_ids - fts_ids)
+    orphan_ids = sorted(fts_ids - doc_ids)
+
+    for doc_id in missing_ids:
+        row = docs_by_id[doc_id]
+        content = read_document_if_exists(str(row["slug"])) or ""
+        update_fts(fts_conn, doc_id, str(row["title"]), content)
+
+    for doc_id in orphan_ids:
+        fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
+
+    return len(missing_ids), len(orphan_ids)
+
+
+def sync_documents_incremental() -> dict[str, int]:
     with connect_db() as conn, connect_fts_db() as fts_conn:
-        md_files = sorted(DOC_DIR.glob("*.md"))
-        existing_rows = conn.execute(
-            "SELECT id, slug, title, created_at, updated_at, meta_json FROM docs"
-        ).fetchall()
-        existing_by_slug = {row["slug"]: row for row in existing_rows}
-        seen_slugs: set[str] = set()
+        md_snapshot = build_markdown_snapshot()
+        db_snapshot = build_db_snapshot(conn)
 
-        for md_file in md_files:
-            slug = md_file.stem
-            seen_slugs.add(slug)
-            content = read_text_normalized(md_file)
-            references = extract_reference_payload(content)
-            row = existing_by_slug.get(slug)
+        md_slugs = set(md_snapshot.keys())
+        db_slugs = set(db_snapshot.keys())
 
-            if row is None:
-                sidecar = load_sidecar(slug)
-                sidecar_title = str(sidecar.get("title", "")).strip()
-                title = sidecar_title or infer_title_from_content(content, slug)
-                if not title:
-                    title = slug
+        new_slugs = sorted(md_slugs - db_slugs)
+        deleted_slugs = sorted(db_slugs - md_slugs)
 
-                unique_title = title
-                suffix = 2
-                while conn.execute(
-                    "SELECT 1 FROM docs WHERE title = ? COLLATE NOCASE",
-                    (unique_title,),
-                ).fetchone():
-                    unique_title = f"{title} ({suffix})"
-                    suffix += 1
+        modified_slugs: list[str] = []
+        for slug in sorted(md_slugs & db_slugs):
+            md_mtime = float(md_snapshot[slug]["mtime"])
+            db_updated_ts = timestamp_from_iso(str(db_snapshot[slug]["updated_at"]))
+            if md_mtime > (db_updated_ts + DIRTY_MTIME_GRACE_SECONDS):
+                modified_slugs.append(slug)
 
-                created_at = str(sidecar.get("created_at") or now_iso())
-                updated_at = str(sidecar.get("updated_at") or now_iso())
-                meta = sidecar.get("meta") if isinstance(sidecar.get("meta"), dict) else {}
-                meta["sidecar"] = f"{slug}.json"
-                conn.execute(
-                    """
-                    INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        unique_title,
-                        slug,
-                        str(md_file),
-                        json.dumps(meta, ensure_ascii=False),
-                        created_at,
-                        updated_at,
-                    ),
-                )
-                doc_id = conn.execute(
-                    "SELECT id FROM docs WHERE slug = ?",
-                    (slug,),
-                ).fetchone()["id"]
-                sidecar_tags = sidecar.get("tags") if isinstance(sidecar.get("tags"), list) else []
-                tags = [str(t).strip() for t in sidecar_tags if str(t).strip()]
-                set_doc_tags(conn, doc_id, tags)
-                set_doc_references(conn, doc_id, references)
-                write_sidecar(
-                    slug=slug,
-                    title=unique_title,
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    tags=tags,
-                    meta=meta,
-                    references=references,
-                )
-                continue
-
-            doc_id = row["id"]
-            current_title = str(row["title"] or "").strip()
-            if not current_title:
-                current_title = infer_title_from_content(content, slug) or slug
-                conn.execute(
-                    "UPDATE docs SET title = ? WHERE id = ?",
-                    (current_title, doc_id),
-                )
-
-            meta = safe_load_json(row["meta_json"])
-            meta["sidecar"] = f"{slug}.json"
-            conn.execute(
-                "UPDATE docs SET file_path = ?, meta_json = ? WHERE id = ?",
-                (str(md_file), json.dumps(meta, ensure_ascii=False), doc_id),
+        total_changes = len(new_slugs) + len(deleted_slugs) + len(modified_slugs)
+        if len(md_snapshot) != len(db_snapshot):
+            print(f"[SYNC] count mismatch detected md={len(md_snapshot)} db={len(db_snapshot)}")
+        if is_severe_divergence(
+            md_count=len(md_snapshot),
+            db_count=len(db_snapshot),
+            total_changes=total_changes,
+        ):
+            raise StartupRecoveryNeeded(
+                "severe startup divergence detected "
+                f"(md={len(md_snapshot)}, db={len(db_snapshot)}, changes={total_changes})"
             )
 
-            tags = list_doc_tags(conn, doc_id)
-            set_doc_references(conn, doc_id, references)
-            write_sidecar(
-                slug=slug,
-                title=current_title,
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-                tags=tags,
-                meta=meta,
-                references=references,
-            )
+        for slug in new_slugs:
+            md_file = md_snapshot[slug]["path"]
+            mtime = float(md_snapshot[slug]["mtime"])
+            sync_new_doc(conn, fts_conn, slug=slug, md_file=md_file, mtime=mtime)
 
-        for row in existing_rows:
-            if row["slug"] in seen_slugs:
-                continue
-            conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
+        for slug in modified_slugs:
+            md_file = md_snapshot[slug]["path"]
+            mtime = float(md_snapshot[slug]["mtime"])
+            row = db_snapshot[slug]
+            sync_modified_doc(conn, fts_conn, row=row, md_file=md_file, mtime=mtime)
 
-        rebuild_fts_index(conn, fts_conn)
+        for slug in deleted_slugs:
+            sync_deleted_doc(conn, fts_conn, row=db_snapshot[slug])
+
+        docs_count = int(conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"])
+        fts_count = int(fts_conn.execute("SELECT COUNT(*) AS c FROM docs_fts").fetchone()["c"])
+        fts_missing = 0
+        fts_orphan = 0
+        if docs_count != fts_count:
+            fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn)
+
+        conn.commit()
+        fts_conn.commit()
+
+        print(
+            "[SYNC] startup incremental sync "
+            f"new={len(new_slugs)} deleted={len(deleted_slugs)} modified={len(modified_slugs)} "
+            f"fts_missing={fts_missing} fts_orphan={fts_orphan}"
+        )
+        return {
+            "new": len(new_slugs),
+            "deleted": len(deleted_slugs),
+            "modified": len(modified_slugs),
+            "fts_missing": fts_missing,
+            "fts_orphan": fts_orphan,
+        }
+
+
+def resolve_db_fix_command() -> list[str] | None:
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable).resolve().parent / "PersonalWikiDBFix.exe"
+        if exe_path.exists():
+            return [str(exe_path)]
+        return None
+
+    script_path = DATA_DIR / "personal_wiki_db_fix.py"
+    if script_path.exists():
+        return [sys.executable, str(script_path)]
+
+    exe_path = DATA_DIR / "PersonalWikiDBFix.exe"
+    if exe_path.exists():
+        return [str(exe_path)]
+    return None
+
+
+def run_db_fix_tool(reason: str) -> bool:
+    command = resolve_db_fix_command()
+    if command is None:
+        print(f"[ERROR] DB fix tool not found. reason={reason}")
+        return False
+
+    print(f"[WARN] Running PersonalWikiDBFix due to startup issue: {reason}")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(DATA_DIR),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        print(f"[ERROR] Failed to launch PersonalWikiDBFix: {error}")
+        return False
+
+    if completed.stdout:
+        print(completed.stdout.rstrip())
+    if completed.stderr:
+        print(completed.stderr.rstrip())
+
+    if completed.returncode != 0:
+        print(f"[ERROR] PersonalWikiDBFix failed with exit code {completed.returncode}")
+        return False
+    return True
+
+
+def sync_documents_on_startup() -> None:
+    try:
+        sync_documents_incremental()
+        return
+    except StartupRecoveryNeeded as error:
+        reason = str(error)
+    except sqlite3.DatabaseError as error:
+        reason = f"database error: {error}"
+
+    if not run_db_fix_tool(reason):
+        raise RuntimeError(f"startup sync failed and DB fix did not complete: {reason}")
+    print("[SYNC] Startup recovery completed by PersonalWikiDBFix.")
 
 
 def ensure_default_home() -> None:
@@ -1314,7 +1540,7 @@ def bootstrap() -> None:
     init_storage()
     init_db()
     init_fts_db()
-    sync_documents()
+    sync_documents_on_startup()
     ensure_default_home()
 
 

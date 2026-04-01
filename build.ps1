@@ -1,13 +1,23 @@
 $ErrorActionPreference = "Stop"
 
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+  $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+  throw "Python executable not found. Install Python 3 and ensure 'python' or 'py' is available in PATH."
+}
+
+$pythonExe = $pythonCommand.Source
+
 Write-Host "[1/3] Installing dependencies..."
-python -m pip install -r requirements.txt
+& $pythonExe -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) {
   throw "Dependency installation failed."
 }
 
 Write-Host "[2/3] Building PersonalWiki.exe (onedir) with PyInstaller..."
-python -m PyInstaller --noconfirm --clean --onedir --name PersonalWiki `
+& $pythonExe -m PyInstaller --noconfirm --clean --onedir --name PersonalWiki `
   --add-data "templates;templates" `
   --add-data "static;static" `
   app.py
@@ -16,7 +26,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[3/3] Building PersonalWikiDBFix.exe (onefile) next to PersonalWiki.exe..."
-python -m PyInstaller --noconfirm --clean --onefile --name PersonalWikiDBFix `
+& $pythonExe -m PyInstaller --noconfirm --clean --onefile --name PersonalWikiDBFix `
   --distpath "dist\\PersonalWiki" `
   --workpath "build\\PersonalWikiDBFix" `
   --specpath "build\\PersonalWikiDBFix" `

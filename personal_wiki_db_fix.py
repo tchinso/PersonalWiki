@@ -23,8 +23,8 @@ DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 
 
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def iso_from_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
 
 
 def normalize_newlines(text: str) -> str:
@@ -320,8 +320,10 @@ def recreate_databases() -> tuple[int, int]:
                     main_conn,
                     str(sidecar.get("title", "")).strip() or infer_title_from_content(content, slug) or slug,
                 )
-                created_at = str(sidecar.get("created_at") or now_iso())
-                updated_at = str(sidecar.get("updated_at") or created_at)
+                file_updated_at = iso_from_timestamp(md_file.stat().st_mtime)
+                created_at_raw = str(sidecar.get("created_at") or "").strip()
+                created_at = created_at_raw or file_updated_at
+                updated_at = file_updated_at
 
                 meta = sidecar.get("meta")
                 meta_dict = meta if isinstance(meta, dict) else {}
