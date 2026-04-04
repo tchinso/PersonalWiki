@@ -9,6 +9,7 @@ if (-not $pythonCommand) {
 }
 
 $pythonExe = $pythonCommand.Source
+$iconPath = (Resolve-Path "img\\icon.ico").Path
 
 Write-Host "[1/3] Installing dependencies..."
 & $pythonExe -m pip install -r requirements.txt
@@ -20,6 +21,7 @@ Write-Host "[2/3] Building PersonalWiki.exe (onedir) with PyInstaller..."
 & $pythonExe -m PyInstaller --noconfirm --clean --onedir --name PersonalWiki `
   --add-data "templates;templates" `
   --add-data "static;static" `
+  --icon "$iconPath" `
   app.py
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller build failed. If dist\\PersonalWiki is in use, close the running EXE and try again."
@@ -30,6 +32,7 @@ Write-Host "[3/3] Building PersonalWikiDBFix.exe (onefile) next to PersonalWiki.
   --distpath "dist\\PersonalWiki" `
   --workpath "build\\PersonalWikiDBFix" `
   --specpath "build\\PersonalWikiDBFix" `
+  --icon "$iconPath" `
   personal_wiki_db_fix.py
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller build for PersonalWikiDBFix failed."

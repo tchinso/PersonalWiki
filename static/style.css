@@ -317,6 +317,24 @@ button.secondary:hover {
   max-width: 100%;
 }
 
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--line);
+  padding: 8px 10px;
+  vertical-align: top;
+}
+
+.markdown-body th {
+  background: #f4f8fd;
+  text-align: left;
+}
+
 .markdown-body blockquote {
   border-left: 4px solid #c7d2de;
   margin: 0;
