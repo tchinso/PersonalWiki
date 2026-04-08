@@ -39,7 +39,7 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-브라우저에서 `http://127.0.0.1:5000` 접속
+브라우저에서 `http://127.0.0.1:6885` 접속
 
 ## EXE 빌드 (PyInstaller onedir)
 

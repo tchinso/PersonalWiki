@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}Personal Wiki{% endblock %}</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('serve_image', filename='icon.ico') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <script src="{{ url_for('static', filename='wiki.js') }}" defer></script>
     {% block extra_head %}{% endblock %}

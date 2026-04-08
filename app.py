@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -133,6 +134,8 @@ STOPWORDS = {
 DIRTY_MTIME_GRACE_SECONDS = 1.0
 SEVERE_DIFF_MIN_CHANGES = 300
 SEVERE_DIFF_RATIO = 0.9
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 6885
 
 
 class StartupRecoveryNeeded(RuntimeError):
@@ -177,6 +180,18 @@ def close_db(_error: BaseException | None) -> None:
 def init_storage() -> None:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     IMG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_default_favicon()
+
+
+def ensure_default_favicon() -> None:
+    source = RESOURCE_DIR / "img" / "icon.ico"
+    target = IMG_DIR / "icon.ico"
+    if target.exists() or not source.exists():
+        return
+    try:
+        shutil.copyfile(source, target)
+    except OSError as error:
+        print(f"[WARN] failed to copy default favicon: {error}")
 
 
 def init_db() -> None:
@@ -1536,6 +1551,11 @@ def serve_image(filename: str):
     return send_from_directory(IMG_DIR, filename)
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return send_from_directory(IMG_DIR, "icon.ico")
+
+
 def bootstrap() -> None:
     init_storage()
     init_db()
@@ -1548,4 +1568,4 @@ bootstrap()
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=DEFAULT_HOST, port=DEFAULT_PORT, debug=False)

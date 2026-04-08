@@ -21,6 +21,7 @@ Write-Host "[2/3] Building PersonalWiki.exe (onedir) with PyInstaller..."
 & $pythonExe -m PyInstaller --noconfirm --clean --onedir --name PersonalWiki `
   --add-data "templates;templates" `
   --add-data "static;static" `
+  --add-data "img;img" `
   --icon "$iconPath" `
   app.py
 if ($LASTEXITCODE -ne 0) {
