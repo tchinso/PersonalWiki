@@ -17,10 +17,15 @@ CALLOUT_RE = re.compile(r"^\s*!!!\s*(note|info|warn|danger)\s+(.*)$", flags=re.I
 YOUTUBE_RE = re.compile(r"^youtube\((.*)\)$", flags=re.IGNORECASE)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 EXTERNAL_WIKI_TARGET_RE = re.compile(r"^(https?|file)://", flags=re.IGNORECASE)
+FILE_WIKI_TARGET_RE = re.compile(r"^file/", flags=re.IGNORECASE)
 
 
 def _is_external_wiki_target(target: str) -> bool:
     return EXTERNAL_WIKI_TARGET_RE.match(target.strip()) is not None
+
+
+def _is_file_wiki_target(target: str) -> bool:
+    return FILE_WIKI_TARGET_RE.match(target.strip()) is not None
 
 
 def _parse_dimension(value: str, default: int) -> int:
@@ -43,7 +48,7 @@ def extract_reference_targets(text: str) -> tuple[list[str], list[str]]:
         if not raw:
             continue
         target = raw.split("|", 1)[0].strip()
-        if target and not _is_external_wiki_target(target):
+        if target and not _is_external_wiki_target(target) and not _is_file_wiki_target(target):
             wiki_targets.append(target)
 
     for match in TEMPLATE_RE.finditer(text):
@@ -203,6 +208,12 @@ class MarkdownEngine:
                 target, label = [part.strip() for part in raw.split("|", 1)]
             else:
                 target, label = raw, raw
+            if _is_file_wiki_target(target):
+                relative = FILE_WIKI_TARGET_RE.sub("", target.strip(), count=1)
+                relative = relative.lstrip("/\\").replace("\\", "/")
+                if not relative:
+                    return label
+                return f"[{label}](/file/{quote(relative)})"
             if _is_external_wiki_target(target):
                 return f"[{label}](<{target}>)"
             slug = resolve_doc_reference(target)

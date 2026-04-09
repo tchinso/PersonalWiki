@@ -61,40 +61,45 @@ def infer_title_from_content(content: str, fallback: str) -> str:
     return fallback
 
 
-def dedupe_tags(tags: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for raw in tags:
-        tag = str(raw).strip()
-        if not tag:
-            continue
-        key = tag.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(tag)
-    return result
-
-
-def ensure_unique_title(conn: sqlite3.Connection, title: str) -> str:
-    base = title.strip() or "untitled"
-    candidate = base
-    suffix = 2
-    while conn.execute(
-        "SELECT 1 FROM docs WHERE title = ? COLLATE NOCASE",
-        (candidate,),
-    ).fetchone():
-        candidate = f"{base} ({suffix})"
-        suffix += 1
-    return candidate
-
-
 def slugify(title: str) -> str:
     normalized = unicodedata.normalize("NFKC", title).strip()
     normalized = re.sub(r"[^\w\s\-가-힣]", "", normalized, flags=re.UNICODE)
     normalized = re.sub(r"[\s_]+", "-", normalized, flags=re.UNICODE)
     slug = normalized.strip("-").lower()
     return slug or "untitled"
+
+
+def parse_tags(raw: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        tag = part.strip()
+        if not tag:
+            continue
+        lowered = tag.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        result.append(tag)
+    return result
+
+
+def ensure_unique_title(conn: sqlite3.Connection, base_title: str, exclude_doc_id: int | None = None) -> str:
+    title = base_title.strip() or "untitled"
+    candidate = title
+    suffix = 2
+    while True:
+        if exclude_doc_id is None:
+            row = conn.execute("SELECT id FROM docs WHERE title = ? COLLATE NOCASE", (candidate,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM docs WHERE title = ? COLLATE NOCASE AND id != ?",
+                (candidate, exclude_doc_id),
+            ).fetchone()
+        if row is None:
+            return candidate
+        candidate = f"{title} ({suffix})"
+        suffix += 1
 
 
 def normalize_reference_target(value: str) -> str:
@@ -202,6 +207,7 @@ def init_main_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
+    # Legacy cleanup: older versions stored docs_fts in wiki.db.
     conn.execute("DROP TABLE IF EXISTS docs_fts")
 
 
@@ -266,7 +272,7 @@ def write_sidecar(
     updated_at: str,
     tags: list[str],
     meta: dict,
-    references: dict[str, list[str]],
+    references: dict | None = None,
 ) -> None:
     payload = {
         "title": title,
@@ -285,23 +291,16 @@ def write_sidecar(
     )
 
 
-def collect_tags(sidecar: dict) -> list[str]:
+def collect_sidecar_tags(sidecar: dict) -> list[str]:
     raw = sidecar.get("tags")
     if isinstance(raw, list):
-        return dedupe_tags([str(tag) for tag in raw])
+        return parse_tags(",".join(str(item) for item in raw))
     if isinstance(raw, str):
-        return dedupe_tags(raw.split(","))
+        return parse_tags(raw)
     return []
 
 
-def recreate_databases() -> tuple[int, int]:
-    DOC_DIR.mkdir(parents=True, exist_ok=True)
-
-    if DB_PATH.exists():
-        DB_PATH.unlink()
-    if FTS_DB_PATH.exists():
-        FTS_DB_PATH.unlink()
-
+def rebuild_from_doc_dir() -> tuple[int, int]:
     imported = 0
     skipped = 0
 
@@ -311,23 +310,21 @@ def recreate_databases() -> tuple[int, int]:
 
         for md_file in sorted(DOC_DIR.glob("*.md")):
             slug = md_file.stem
-            json_file = DOC_DIR / f"{slug}.json"
-
+            sidecar = read_json_dict(DOC_DIR / f"{slug}.json")
             try:
                 content = read_text_normalized(md_file)
-                sidecar = read_json_dict(json_file)
-                title = ensure_unique_title(
-                    main_conn,
-                    str(sidecar.get("title", "")).strip() or infer_title_from_content(content, slug) or slug,
-                )
-                file_updated_at = iso_from_timestamp(md_file.stat().st_mtime)
-                created_at_raw = str(sidecar.get("created_at") or "").strip()
-                created_at = created_at_raw or file_updated_at
-                updated_at = file_updated_at
 
-                meta = sidecar.get("meta")
-                meta_dict = meta if isinstance(meta, dict) else {}
-                meta_dict["sidecar"] = f"{slug}.json"
+                sidecar_title = str(sidecar.get("title", "")).strip()
+                title_candidate = sidecar_title or infer_title_from_content(content, slug) or slug
+                title = ensure_unique_title(main_conn, title_candidate)
+
+                updated_at = iso_from_timestamp(md_file.stat().st_mtime)
+                created_at_raw = str(sidecar.get("created_at") or "").strip()
+                created_at = created_at_raw or updated_at
+
+                meta_value = sidecar.get("meta")
+                meta = meta_value if isinstance(meta_value, dict) else {}
+                meta["sidecar"] = f"{slug}.json"
 
                 main_conn.execute(
                     """
@@ -338,17 +335,17 @@ def recreate_databases() -> tuple[int, int]:
                         title,
                         slug,
                         str(md_file),
-                        json.dumps(meta_dict, ensure_ascii=False),
+                        json.dumps(meta, ensure_ascii=False),
                         created_at,
                         updated_at,
                     ),
                 )
                 row = main_conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()
                 if row is None:
-                    raise RuntimeError("Failed to read inserted doc id.")
-
+                    raise RuntimeError("failed to fetch inserted doc id")
                 doc_id = int(row["id"])
-                tags = collect_tags(sidecar)
+
+                tags = collect_sidecar_tags(sidecar)
                 references = extract_reference_payload(content)
 
                 set_doc_tags(main_conn, doc_id, tags)
@@ -360,18 +357,26 @@ def recreate_databases() -> tuple[int, int]:
                     created_at=created_at,
                     updated_at=updated_at,
                     tags=tags,
-                    meta=meta_dict,
+                    meta=meta,
                     references=references,
                 )
                 imported += 1
             except Exception as error:
                 skipped += 1
-                print(f"[WARN] Skipped {md_file.name}: {error}")
+                print(f"[WARN] skipped {md_file.name}: {error}")
 
         main_conn.commit()
         fts_conn.commit()
-
     return imported, skipped
+
+
+def recreate_databases() -> tuple[int, int]:
+    DOC_DIR.mkdir(parents=True, exist_ok=True)
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+    if FTS_DB_PATH.exists():
+        FTS_DB_PATH.unlink()
+    return rebuild_from_doc_dir()
 
 
 def main() -> int:
@@ -384,11 +389,11 @@ def main() -> int:
     try:
         imported, skipped = recreate_databases()
     except Exception as error:
-        print(f"[ERROR] Failed to rebuild databases: {error}")
+        print(f"[ERROR] failed to rebuild databases: {error}")
         return 1
 
-    print(f"[OK] Recreated databases from /doc: imported={imported}, skipped={skipped}")
-    print("[OK] Sidecar JSON files now include backlink reference cache.")
+    print(f"[OK] recreated databases from /doc: imported={imported}, skipped={skipped}")
+    print("[OK] sidecar JSON now includes normalized backlink reference cache.")
     return 0
 
 

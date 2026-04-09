@@ -45,6 +45,7 @@ def runtime_paths() -> tuple[Path, Path]:
 RESOURCE_DIR, DATA_DIR = runtime_paths()
 DOC_DIR = DATA_DIR / "doc"
 IMG_DIR = DATA_DIR / "img"
+FILE_DIR = DATA_DIR / "file"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 TEMPLATE_DIR = RESOURCE_DIR / "templates"
@@ -131,11 +132,16 @@ STOPWORDS = {
 }
 
 
-DIRTY_MTIME_GRACE_SECONDS = 1.0
-SEVERE_DIFF_MIN_CHANGES = 300
+DIRTY_MTIME_GRACE_SECONDS = 5.0
+SEVERE_DIFF_MIN_CHANGES = 50
 SEVERE_DIFF_RATIO = 0.9
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6885
+UNLINKABLE_TITLE_PREFIXES = ("http://", "https://", "file/")
+TITLE_LINK_LIMIT_WARNING = (
+    "이 문서는 위키 엔진 한계상 링크가 제대로 동작하지 않을 수 있습니다. "
+    "제목이 file/, http://, https:// 로 시작하면 위키 링크 해석이 충돌할 수 있습니다."
+)
 
 
 class StartupRecoveryNeeded(RuntimeError):
@@ -180,6 +186,7 @@ def close_db(_error: BaseException | None) -> None:
 def init_storage() -> None:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     IMG_DIR.mkdir(parents=True, exist_ok=True)
+    FILE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_default_favicon()
 
 
@@ -464,6 +471,28 @@ def parse_tags(raw: str) -> list[str]:
         seen.add(lowered)
         result.append(tag)
     return result
+
+
+def collect_sidecar_tags(sidecar: dict) -> list[str]:
+    tags_value = sidecar.get("tags")
+    if isinstance(tags_value, list):
+        return parse_tags(",".join(str(item) for item in tags_value))
+    if isinstance(tags_value, str):
+        return parse_tags(tags_value)
+    return []
+
+
+def has_unlinkable_title_prefix(title: str) -> bool:
+    lowered = title.strip().casefold()
+    return any(lowered.startswith(prefix) for prefix in UNLINKABLE_TITLE_PREFIXES)
+
+
+def title_prefix_warning(title: str) -> str | None:
+    if not title:
+        return None
+    if has_unlinkable_title_prefix(title):
+        return TITLE_LINK_LIMIT_WARNING
+    return None
 
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
@@ -759,6 +788,25 @@ def build_db_snapshot(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {row["slug"]: row for row in rows}
 
 
+def detect_incremental_changes(
+    md_snapshot: dict[str, dict[str, object]],
+    db_snapshot: dict[str, sqlite3.Row],
+) -> tuple[list[str], list[str], list[str]]:
+    md_slugs = set(md_snapshot.keys())
+    db_slugs = set(db_snapshot.keys())
+
+    new_slugs = sorted(md_slugs - db_slugs)
+    deleted_slugs = sorted(db_slugs - md_slugs)
+
+    modified_slugs: list[str] = []
+    for slug in sorted(md_slugs & db_slugs):
+        md_mtime = float(md_snapshot[slug]["mtime"])
+        db_updated_ts = timestamp_from_iso(str(db_snapshot[slug]["updated_at"]))
+        if md_mtime > (db_updated_ts + DIRTY_MTIME_GRACE_SECONDS):
+            modified_slugs.append(slug)
+    return new_slugs, deleted_slugs, modified_slugs
+
+
 def is_severe_divergence(*, md_count: int, db_count: int, total_changes: int) -> bool:
     if total_changes < SEVERE_DIFF_MIN_CHANGES:
         return False
@@ -809,13 +857,7 @@ def sync_new_doc(
         raise RuntimeError(f"failed to create doc row for slug '{slug}'")
     doc_id = int(doc_row["id"])
 
-    tags_value = sidecar.get("tags")
-    if isinstance(tags_value, list):
-        tags = parse_tags(",".join(str(item) for item in tags_value))
-    elif isinstance(tags_value, str):
-        tags = parse_tags(tags_value)
-    else:
-        tags = []
+    tags = collect_sidecar_tags(sidecar)
 
     set_doc_tags(conn, doc_id, tags)
     set_doc_references(conn, doc_id, references)
@@ -913,19 +955,7 @@ def sync_documents_incremental() -> dict[str, int]:
     with connect_db() as conn, connect_fts_db() as fts_conn:
         md_snapshot = build_markdown_snapshot()
         db_snapshot = build_db_snapshot(conn)
-
-        md_slugs = set(md_snapshot.keys())
-        db_slugs = set(db_snapshot.keys())
-
-        new_slugs = sorted(md_slugs - db_slugs)
-        deleted_slugs = sorted(db_slugs - md_slugs)
-
-        modified_slugs: list[str] = []
-        for slug in sorted(md_slugs & db_slugs):
-            md_mtime = float(md_snapshot[slug]["mtime"])
-            db_updated_ts = timestamp_from_iso(str(db_snapshot[slug]["updated_at"]))
-            if md_mtime > (db_updated_ts + DIRTY_MTIME_GRACE_SECONDS):
-                modified_slugs.append(slug)
+        new_slugs, deleted_slugs, modified_slugs = detect_incremental_changes(md_snapshot, db_snapshot)
 
         total_changes = len(new_slugs) + len(deleted_slugs) + len(modified_slugs)
         if len(md_snapshot) != len(db_snapshot):
@@ -1177,6 +1207,7 @@ def new_doc():
             exclude_tags=tags,
             limit=10,
         )
+        title_warning = title_prefix_warning(title)
 
         if not title:
             return render_template(
@@ -1187,6 +1218,7 @@ def new_doc():
                 tags_text=", ".join(tags),
                 error="문서 제목을 입력해 주세요.",
                 tag_warning=None,
+                title_warning=title_warning,
                 show_ignore_tag_warning=False,
                 recommended_tags=suggested_tags,
             )
@@ -1204,6 +1236,7 @@ def new_doc():
                 tags_text=", ".join(tags),
                 error="같은 제목의 문서가 이미 있습니다.",
                 tag_warning=None,
+                title_warning=title_warning,
                 show_ignore_tag_warning=False,
                 recommended_tags=suggested_tags,
             )
@@ -1217,6 +1250,7 @@ def new_doc():
                 tags_text=", ".join(tags),
                 error=None,
                 tag_warning="태그를 2개 이상 등록하면 나중에 검색이 더 쉬워집니다. 계속 생성하려면 아래 버튼을 눌러 주세요.",
+                title_warning=title_warning,
                 show_ignore_tag_warning=True,
                 recommended_tags=suggested_tags,
             )
@@ -1272,6 +1306,7 @@ def new_doc():
         tags_text="",
         error=None,
         tag_warning=None,
+        title_warning=title_prefix_warning(prefilled_title),
         show_ignore_tag_warning=False,
         recommended_tags=[],
     )
@@ -1301,6 +1336,7 @@ def edit_doc(slug: str):
             exclude_tags=new_tags,
             limit=10,
         )
+        title_warning = title_prefix_warning(new_title)
 
         if not new_title:
             return render_template(
@@ -1311,6 +1347,7 @@ def edit_doc(slug: str):
                 tags_text=", ".join(new_tags),
                 error="문서 제목을 입력해 주세요.",
                 tag_warning=None,
+                title_warning=title_warning,
                 show_ignore_tag_warning=False,
                 recommended_tags=suggested_tags,
             )
@@ -1328,6 +1365,7 @@ def edit_doc(slug: str):
                 tags_text=", ".join(new_tags),
                 error="같은 제목의 문서가 이미 있습니다.",
                 tag_warning=None,
+                title_warning=title_warning,
                 show_ignore_tag_warning=False,
                 recommended_tags=suggested_tags,
             )
@@ -1396,6 +1434,7 @@ def edit_doc(slug: str):
         tags_text=", ".join(tags),
         error=None,
         tag_warning=None,
+        title_warning=title_prefix_warning(doc["title"]),
         show_ignore_tag_warning=False,
         recommended_tags=recommend_tags(
             conn,
@@ -1549,6 +1588,11 @@ def tag_suggestions():
 @app.route("/img/<path:filename>")
 def serve_image(filename: str):
     return send_from_directory(IMG_DIR, filename)
+
+
+@app.route("/file/<path:filename>")
+def serve_file(filename: str):
+    return send_from_directory(FILE_DIR, filename)
 
 
 @app.route("/favicon.ico")

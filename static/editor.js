@@ -6,7 +6,9 @@
   const suggestionWrap = document.getElementById("tag-suggestions");
   const suggestButton = document.getElementById("suggest-tags-btn");
   const editForm = document.querySelector(".edit-form");
+  const titleWarning = document.getElementById("title-link-warning");
   const currentSlug = editForm ? editForm.dataset.currentSlug || "" : "";
+  const unlinkableTitlePrefixes = ["file/", "http://", "https://"];
 
   let previewTimer = null;
   let initialSnapshot = "";
@@ -47,6 +49,22 @@
 
   function currentTagSet() {
     return new Set(parseTags(tagsInput ? tagsInput.value : "").map((tag) => tag.toLowerCase()));
+  }
+
+  function hasUnlinkableTitlePrefix(rawTitle) {
+    const value = String(rawTitle || "").trim().toLowerCase();
+    return unlinkableTitlePrefixes.some((prefix) => value.startsWith(prefix));
+  }
+
+  function syncTitleWarning() {
+    if (!titleInput || !titleWarning) {
+      return;
+    }
+    const shouldWarn = hasUnlinkableTitlePrefix(titleInput.value);
+    titleWarning.hidden = !shouldWarn;
+    if (shouldWarn && !titleWarning.textContent.trim()) {
+      titleWarning.textContent = titleWarning.dataset.warningMessage || "";
+    }
   }
 
   function addTag(tag) {
@@ -150,6 +168,7 @@
 
   if (editForm) {
     initialSnapshot = buildSnapshot();
+    syncTitleWarning();
 
     editForm.addEventListener("submit", () => {
       isSubmitting = true;
@@ -162,6 +181,10 @@
       event.preventDefault();
       event.returnValue = "";
     });
+  }
+
+  if (titleInput) {
+    titleInput.addEventListener("input", syncTitleWarning);
   }
 
   if (suggestButton) {

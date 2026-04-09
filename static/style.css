@@ -271,6 +271,14 @@ button.secondary:hover {
   border-radius: 8px;
 }
 
+.danger-warning {
+  background: #fef2f2;
+  border: 1px solid #f4b7b7;
+  color: #991b1b;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
 .warning {
   background: #fff9e9;
   border: 1px solid #f2d9a0;
