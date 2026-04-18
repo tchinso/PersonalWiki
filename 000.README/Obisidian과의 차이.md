@@ -3,7 +3,7 @@
 ## 유튜브 임베드
 독자적인 유튜브 첨부 문법 사용
 * Obsidian
-* 
+
 지원하지 않음
 * Personal Wiki
 
