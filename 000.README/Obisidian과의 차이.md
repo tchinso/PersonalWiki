@@ -33,11 +33,11 @@
 
 PersonalWiki에서는 웹사이트 링크를 첨부할 때 아래 형태가 표준 문법입니다
 
-[[https://example.com|보이는 텍스트]] 
+` [[https://example.com|보이는 텍스트]] ` 
 
 그러나, Obsidian Web Clipper와의 호환을 위해 아래 문법도 지원합니다.
 
-[https://example.com](보이는 텍스트)
+` [https://example.com](보이는 텍스트)` 
 
 # Obsidian과 차이가 있음
 
