@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -444,18 +444,37 @@ def write_sidecar(
     )
 
 
-def list_doc_tags(conn: sqlite3.Connection, doc_id: int) -> list[str]:
+def build_doc_tag_map(conn: sqlite3.Connection, doc_ids: list[int]) -> dict[int, list[str]]:
+    unique_doc_ids: list[int] = []
+    seen: set[int] = set()
+    for doc_id in doc_ids:
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        unique_doc_ids.append(doc_id)
+    if not unique_doc_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in unique_doc_ids)
     rows = conn.execute(
-        """
-        SELECT t.name
-        FROM tags t
-        JOIN doc_tags dt ON dt.tag_id = t.id
-        WHERE dt.doc_id = ?
-        ORDER BY t.name COLLATE NOCASE
+        f"""
+        SELECT dt.doc_id, t.name
+        FROM doc_tags dt
+        JOIN tags t ON t.id = dt.tag_id
+        WHERE dt.doc_id IN ({placeholders})
+        ORDER BY dt.doc_id, t.name COLLATE NOCASE
         """,
-        (doc_id,),
+        unique_doc_ids,
     ).fetchall()
-    return [row["name"] for row in rows]
+
+    mapping: dict[int, list[str]] = defaultdict(list)
+    for row in rows:
+        mapping[int(row["doc_id"])].append(str(row["name"]))
+    return dict(mapping)
+
+
+def list_doc_tags(conn: sqlite3.Connection, doc_id: int) -> list[str]:
+    return build_doc_tag_map(conn, [doc_id]).get(doc_id, [])
 
 
 def parse_tags(raw: str) -> list[str]:
@@ -497,13 +516,21 @@ def title_prefix_warning(title: str) -> str | None:
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
     conn.execute("DELETE FROM doc_tags WHERE doc_id = ?", (doc_id,))
-    for tag in tags:
-        conn.execute("INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING", (tag,))
-        tag_row = conn.execute("SELECT id FROM tags WHERE name = ?", (tag,)).fetchone()
-        if tag_row:
-            conn.execute(
+    normalized_tags = parse_tags(",".join(str(tag) for tag in tags))
+    if normalized_tags:
+        conn.executemany(
+            "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
+            [(tag,) for tag in normalized_tags],
+        )
+        name_filters = " OR ".join("name = ? COLLATE NOCASE" for _ in normalized_tags)
+        tag_rows = conn.execute(
+            f"SELECT id FROM tags WHERE {name_filters}",
+            normalized_tags,
+        ).fetchall()
+        if tag_rows:
+            conn.executemany(
                 "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
-                (doc_id, tag_row["id"]),
+                [(doc_id, int(row["id"])) for row in tag_rows],
             )
     conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
 
@@ -586,6 +613,66 @@ def normalize_search_query(query: str) -> str:
     return " ".join(query.split())
 
 
+def extract_tag_search_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"\s+", query):
+        token = raw.strip().strip("\"'()")
+        token = token.lstrip("#")
+        if not token:
+            continue
+        if token.casefold() in {"and", "or", "not"}:
+            continue
+        key = token.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(token)
+    return terms
+
+
+def search_docs_by_tags(conn: sqlite3.Connection, terms: list[str], *, limit: int = 200) -> list[dict]:
+    if not terms:
+        return []
+
+    patterns = [f"%{term}%" for term in terms if term]
+    if not patterns:
+        return []
+
+    where_clause = " OR ".join("t.name LIKE ? COLLATE NOCASE" for _ in patterns)
+    rows = conn.execute(
+        f"""
+        SELECT
+            d.id AS doc_id,
+            d.title,
+            d.slug,
+            d.updated_at,
+            GROUP_CONCAT(DISTINCT t.name) AS matched_tags_csv
+        FROM docs d
+        JOIN doc_tags dt ON dt.doc_id = d.id
+        JOIN tags t ON t.id = dt.tag_id
+        WHERE {where_clause}
+        GROUP BY d.id, d.title, d.slug, d.updated_at
+        ORDER BY d.updated_at DESC, d.title COLLATE NOCASE
+        LIMIT ?
+        """,
+        [*patterns, limit],
+    ).fetchall()
+
+    hits: list[dict] = []
+    for row in rows:
+        matched_tags = parse_tags(str(row["matched_tags_csv"] or ""))
+        hits.append(
+            {
+                "doc_id": int(row["doc_id"]),
+                "title": str(row["title"]),
+                "slug": str(row["slug"]),
+                "matched_tags": matched_tags,
+            }
+        )
+    return hits
+
+
 def singularize_token(token: str) -> str:
     if not token.isascii() or not token.isalpha():
         return token
@@ -651,6 +738,7 @@ def recommend_tags(
         return []
 
     rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
+    tag_map = build_doc_tag_map(conn, [int(row["id"]) for row in rows])
     corpus: list[dict] = []
     for row in rows:
         if current_slug and row["slug"] == current_slug:
@@ -662,7 +750,7 @@ def recommend_tags(
         corpus.append(
             {
                 "tokens": doc_tokens,
-                "tags": list_doc_tags(conn, row["id"]),
+                "tags": tag_map.get(int(row["id"]), []),
             }
         )
     if not corpus:
@@ -1147,10 +1235,11 @@ def fetch_docs_for_index(conn: sqlite3.Connection) -> list[dict]:
         ORDER BY updated_at DESC, title COLLATE NOCASE
         """
     ).fetchall()
+    tag_map = build_doc_tag_map(conn, [int(row["id"]) for row in rows])
     docs: list[dict] = []
     for row in rows:
         item = dict(row)
-        item["tags"] = list_doc_tags(conn, row["id"])
+        item["tags"] = tag_map.get(int(row["id"]), [])
         docs.append(item)
     return docs
 
@@ -1502,7 +1591,10 @@ def search():
     error: str | None = None
 
     if query:
+        merged_by_doc_id: dict[int, dict] = {}
+        ordered_doc_ids: list[int] = []
         normalized = normalize_search_query(query)
+
         try:
             fts_rows = fts_conn.execute(
                 """
@@ -1532,15 +1624,34 @@ def search():
                 doc_meta = docs_by_id.get(doc_id)
                 if not doc_meta:
                     continue
-                results.append(
-                    {
-                        "title": doc_meta["title"],
-                        "slug": doc_meta["slug"],
-                        "excerpt": row["excerpt"],
-                    }
-                )
+                merged_by_doc_id[doc_id] = {
+                    "title": doc_meta["title"],
+                    "slug": doc_meta["slug"],
+                    "excerpt": row["excerpt"],
+                    "matched_tags": [],
+                }
+                ordered_doc_ids.append(doc_id)
         except sqlite3.OperationalError:
             error = "검색식이 올바르지 않습니다. 예: flask AND sqlite, python NOT django"
+
+        tag_terms = extract_tag_search_terms(query)
+        for hit in search_docs_by_tags(conn, tag_terms, limit=200):
+            doc_id = int(hit["doc_id"])
+            if doc_id in merged_by_doc_id:
+                existing = merged_by_doc_id[doc_id]
+                existing_tags = [str(tag) for tag in existing.get("matched_tags", [])]
+                existing["matched_tags"] = parse_tags(",".join([*existing_tags, *hit["matched_tags"]]))
+                continue
+
+            merged_by_doc_id[doc_id] = {
+                "title": hit["title"],
+                "slug": hit["slug"],
+                "excerpt": "",
+                "matched_tags": hit["matched_tags"],
+            }
+            ordered_doc_ids.append(doc_id)
+
+        results = [merged_by_doc_id[doc_id] for doc_id in ordered_doc_ids]
 
     return render_template(
         "search.html",
@@ -1613,3 +1724,4 @@ bootstrap()
 
 if __name__ == "__main__":
     app.run(host=DEFAULT_HOST, port=DEFAULT_PORT, debug=False)
+

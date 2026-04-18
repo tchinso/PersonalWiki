@@ -1,11 +1,11 @@
-{% extends "base.html" %}
+﻿{% extends "base.html" %}
 
 {% block title %}검색 | Personal Wiki{% endblock %}
 
 {% block content %}
 <section class="panel">
   <h1>검색</h1>
-  <p class="muted">제목 + 본문 통합 검색, 연산자: <code>AND</code> <code>OR</code> <code>NOT</code></p>
+  <p class="muted">제목 + 본문 + 태그 통합 검색, 연산자: <code>AND</code> <code>OR</code> <code>NOT</code></p>
 
   {% if error %}
     <p class="error">{{ error }}</p>
@@ -19,7 +19,16 @@
         {% for item in results %}
           <li class="doc-item">
             <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
-            <p class="excerpt">{{ item.excerpt|safe }}</p>
+            {% if item.excerpt %}
+              <p class="excerpt">{{ item.excerpt|safe }}</p>
+            {% endif %}
+            {% if item.matched_tags %}
+              <div class="tag-row">
+                {% for tag in item.matched_tags %}
+                  <a class="tag" href="{{ url_for('docs_by_tag', tag_name=tag) }}">#{{ tag }}</a>
+                {% endfor %}
+              </div>
+            {% endif %}
           </li>
         {% endfor %}
       </ul>

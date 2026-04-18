@@ -380,6 +380,26 @@ button.secondary:hover {
   color: #111827;
 }
 
+.markdown-body .template-fold {
+  margin: 12px 0;
+  border: 1px solid #d8e2ee;
+  border-radius: 10px;
+  background: #f8fbff;
+  padding: 0 10px 10px;
+}
+
+.markdown-body .template-fold > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #334155;
+  padding: 10px 0;
+}
+
+.markdown-body .template-fold[open] > summary {
+  border-bottom: 1px solid #dde5ef;
+  margin-bottom: 10px;
+}
+
 .markdown-body .callout {
   border-left: 4px solid #64748b;
   border-radius: 8px;

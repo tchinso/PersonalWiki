@@ -222,15 +222,22 @@ def init_fts_db(conn: sqlite3.Connection) -> None:
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
     conn.execute("DELETE FROM doc_tags WHERE doc_id = ?", (doc_id,))
-    for tag in tags:
-        conn.execute("INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING", (tag,))
-        row = conn.execute("SELECT id FROM tags WHERE name = ?", (tag,)).fetchone()
-        if row is None:
-            continue
-        conn.execute(
-            "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
-            (doc_id, row["id"]),
+    normalized_tags = parse_tags(",".join(str(tag) for tag in tags))
+    if normalized_tags:
+        conn.executemany(
+            "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
+            [(tag,) for tag in normalized_tags],
         )
+        name_filters = " OR ".join("name = ? COLLATE NOCASE" for _ in normalized_tags)
+        rows = conn.execute(
+            f"SELECT id FROM tags WHERE {name_filters}",
+            normalized_tags,
+        ).fetchall()
+        if rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
+                [(doc_id, int(row["id"])) for row in rows],
+            )
     conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
 
 
