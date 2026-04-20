@@ -7,9 +7,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from flask import (
@@ -130,6 +132,19 @@ STOPWORDS = {
     "기능",
     "추가",
 }
+
+
+_TAG_RECOMMEND_CACHE_LOCK = threading.Lock()
+_TAG_RECOMMEND_CACHE: dict[str, object] = {
+    "signature": None,
+    "corpus": [],
+}
+
+
+def invalidate_tag_recommendation_cache() -> None:
+    with _TAG_RECOMMEND_CACHE_LOCK:
+        _TAG_RECOMMEND_CACHE["signature"] = None
+        _TAG_RECOMMEND_CACHE["corpus"] = []
 
 
 DIRTY_MTIME_GRACE_SECONDS = 5.0
@@ -673,6 +688,7 @@ def search_docs_by_tags(conn: sqlite3.Connection, terms: list[str], *, limit: in
     return hits
 
 
+@lru_cache(maxsize=8192)
 def singularize_token(token: str) -> str:
     if not token.isascii() or not token.isalpha():
         return token
@@ -724,8 +740,78 @@ def cosine_similarity(vec_a: dict[str, float], vec_b: dict[str, float]) -> float
     return numerator / (norm_a * norm_b)
 
 
+def build_tag_recommendation_signature(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+) -> tuple[int, str, int, int]:
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM docs) AS docs_count,
+            (SELECT COALESCE(MAX(updated_at), '') FROM docs) AS docs_max_updated_at,
+            (SELECT COUNT(*) FROM doc_tags) AS doc_tag_count
+        """
+    ).fetchone()
+    if row is None:
+        return (0, "", 0, 0)
+    fts_count_row = fts_conn.execute("SELECT COUNT(*) AS c FROM docs_fts").fetchone()
+    fts_count = int(fts_count_row["c"]) if fts_count_row is not None else 0
+    return (
+        int(row["docs_count"]),
+        str(row["docs_max_updated_at"]),
+        int(row["doc_tag_count"]),
+        fts_count,
+    )
+
+
+def build_tag_recommendation_corpus(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+) -> list[dict[str, object]]:
+    signature = build_tag_recommendation_signature(conn, fts_conn)
+    with _TAG_RECOMMEND_CACHE_LOCK:
+        cached_signature = _TAG_RECOMMEND_CACHE.get("signature")
+        cached_corpus = _TAG_RECOMMEND_CACHE.get("corpus")
+        if cached_signature == signature and isinstance(cached_corpus, list):
+            return cached_corpus
+
+    rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
+    if not rows:
+        with _TAG_RECOMMEND_CACHE_LOCK:
+            _TAG_RECOMMEND_CACHE["signature"] = signature
+            _TAG_RECOMMEND_CACHE["corpus"] = []
+        return []
+
+    doc_ids = [int(row["id"]) for row in rows]
+    tag_map = build_doc_tag_map(conn, doc_ids)
+    fts_rows = fts_conn.execute("SELECT rowid AS doc_id, content FROM docs_fts").fetchall()
+    content_map = {int(row["doc_id"]): str(row["content"] or "") for row in fts_rows}
+
+    corpus: list[dict[str, object]] = []
+    for row in rows:
+        doc_id = int(row["id"])
+        doc_tokens = tokenize_text(f"{row['title']}\n{content_map.get(doc_id, '')}")
+        if not doc_tokens:
+            continue
+        tf_counter = Counter(doc_tokens)
+        corpus.append(
+            {
+                "slug": str(row["slug"]),
+                "tags": tag_map.get(doc_id, []),
+                "tf_counter": tf_counter,
+                "token_set": set(tf_counter.keys()),
+            }
+        )
+
+    with _TAG_RECOMMEND_CACHE_LOCK:
+        _TAG_RECOMMEND_CACHE["signature"] = signature
+        _TAG_RECOMMEND_CACHE["corpus"] = corpus
+    return corpus
+
+
 def recommend_tags(
     conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
     *,
     title: str,
     content: str,
@@ -737,28 +823,18 @@ def recommend_tags(
     if not query_tokens:
         return []
 
-    rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
-    tag_map = build_doc_tag_map(conn, [int(row["id"]) for row in rows])
-    corpus: list[dict] = []
-    for row in rows:
-        if current_slug and row["slug"] == current_slug:
-            continue
-        doc_content = read_document(row["slug"])
-        doc_tokens = tokenize_text(f"{row['title']}\n{doc_content}")
-        if not doc_tokens:
-            continue
-        corpus.append(
-            {
-                "tokens": doc_tokens,
-                "tags": tag_map.get(int(row["id"]), []),
-            }
-        )
+    base_corpus = build_tag_recommendation_corpus(conn, fts_conn)
+    corpus = [
+        doc
+        for doc in base_corpus
+        if not current_slug or str(doc["slug"]) != current_slug
+    ]
     if not corpus:
         return []
 
     df_counter: Counter[str] = Counter()
     for doc in corpus:
-        for token in set(doc["tokens"]):
+        for token in doc["token_set"]:
             df_counter[token] += 1
 
     total_docs = len(corpus)
@@ -768,10 +844,10 @@ def recommend_tags(
 
     scored_docs: list[tuple[float, list[str]]] = []
     for doc in corpus:
-        doc_vec = build_tfidf_vector(Counter(doc["tokens"]), df_counter, total_docs)
+        doc_vec = build_tfidf_vector(doc["tf_counter"], df_counter, total_docs)
         similarity = cosine_similarity(query_vec, doc_vec)
         if similarity > 0:
-            scored_docs.append((similarity, doc["tags"]))
+            scored_docs.append((similarity, list(doc["tags"])))
     if not scored_docs:
         return []
 
@@ -1081,6 +1157,8 @@ def sync_documents_incremental() -> dict[str, int]:
 
         conn.commit()
         fts_conn.commit()
+        if total_changes > 0 or fts_missing > 0 or fts_orphan > 0:
+            invalidate_tag_recommendation_cache()
 
         print(
             "[SYNC] startup incremental sync "
@@ -1215,6 +1293,7 @@ def ensure_default_home() -> None:
             meta=meta,
             references=references,
         )
+        invalidate_tag_recommendation_cache()
 
 
 def fetch_doc_with_tags(conn: sqlite3.Connection, slug: str) -> dict | None:
@@ -1291,6 +1370,7 @@ def new_doc():
         ignore_tag_warning = request.form.get("ignore_tag_warning") == "1"
         suggested_tags = recommend_tags(
             conn,
+            fts_conn,
             title=title,
             content=content,
             exclude_tags=tags,
@@ -1380,6 +1460,7 @@ def new_doc():
             )
             conn.commit()
             fts_conn.commit()
+            invalidate_tag_recommendation_cache()
         except Exception:
             conn.rollback()
             fts_conn.rollback()
@@ -1419,6 +1500,7 @@ def edit_doc(slug: str):
         new_tags = parse_tags(request.form.get("tags", ""))
         suggested_tags = recommend_tags(
             conn,
+            fts_conn,
             title=new_title or row["title"],
             content=new_content,
             current_slug=row["slug"],
@@ -1508,6 +1590,7 @@ def edit_doc(slug: str):
             )
             conn.commit()
             fts_conn.commit()
+            invalidate_tag_recommendation_cache()
         except Exception:
             conn.rollback()
             fts_conn.rollback()
@@ -1527,6 +1610,7 @@ def edit_doc(slug: str):
         show_ignore_tag_warning=False,
         recommended_tags=recommend_tags(
             conn,
+            fts_conn,
             title=doc["title"],
             content=current_content,
             current_slug=doc["slug"],
@@ -1549,6 +1633,7 @@ def delete_doc(slug: str):
         conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
         conn.commit()
         fts_conn.commit()
+        invalidate_tag_recommendation_cache()
     except Exception:
         conn.rollback()
         fts_conn.rollback()
@@ -1673,6 +1758,7 @@ def preview():
 @app.post("/api/tag-suggestions")
 def tag_suggestions():
     conn = get_db()
+    fts_conn = get_fts_db()
     payload = request.get_json(silent=True) or {}
 
     title = str(payload.get("title", "")).strip()
@@ -1687,6 +1773,7 @@ def tag_suggestions():
 
     suggestions = recommend_tags(
         conn,
+        fts_conn,
         title=title,
         content=content,
         current_slug=current_slug,
