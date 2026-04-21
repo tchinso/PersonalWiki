@@ -1,37 +1,98 @@
-# Personal Wiki (Flask + SQLite + JSON)
+# PersonalWiki
 
-개인 PC에서 실행하는 로컬 위키입니다.
+간단한 로컬 기반 위키 시스템
+Markdown 기반 문서 작성 + 빠른 검색 + 위키 링크 지원
+
+---
 
 ## 주요 기능
 
-- Markdown 문서 작성/수정 + 실시간 미리보기
-- 위키 링크: `[[문서명]]` 또는 `[[문서명|표시 텍스트]]`
-- 이미지 삽입: `![[파일명.png]]`
-- 파일 삽입: `[[file/파일명.파일확장자]]`
-- 하이라이트: `==강조==`
-- 스포일러: `||숨김 텍스트||` (클릭 토글)
-- 유튜브 임베드:
-  - `![[youtube(HhnETSN6U_E)]]`
-  - `![[youtube(HhnETSN6U_E, width=640, height=360)]]`
-- 콜아웃:
-  - `!!! note 내용` (초록)
-  - `!!! info 내용` (파랑)
-  - `!!! warn 내용` (주황)
-  - `!!! danger 내용` (빨강)
-- 템플릿 포함: `{{템플릿문서}}` (한 번만 확장, 중첩 템플릿 미확장)
-- 백링크: 현재 문서를 링크/템플릿 참조한 문서 목록
-- 태그 경고: 문서 생성 시 태그 2개 미만이면 경고
-- 태그 자동추천: 불용어/복수형 정규화 + TF-IDF + 코사인 유사도 기반, 최대 10개
+### 텍스트 스타일
+
+* `*기울임*`
+* `**진하게**`
+* `~~취소선~~`
+
+### 하이라이트
+
+* `==형광펜==`
+* `==**진한글씨 형광펜**==`
+
+### 스포일러
+
+* `||숨김 텍스트||`
+
+### 위키 링크
+
+* `[[문서명]]`
+* `[[문서명|표시 텍스트]]`
+
+### 이미지 삽입
+
+* `![[image.png]]`
+* `![[image.png, width=640]]`
+* `![[image.png, height=360]]`
+
+### 파일 첨부
+
+* `[[file/file.zip]]`
+
+---
+
+### 템플릿
+
+* `{{템플릿}}`
+  → 한 번만 확장됨 (중첩 템플릿 미지원)
+
+* 접기 템플릿
+  `||{{템플릿}}||`
+
+> ⚠️ 문서 내부 folding은 지원하지 않음
+> folding이 필요한 내용은 반드시 별도 문서로 분리 후 템플릿으로 사용
+
+---
+
+### 유튜브 임베드
+
+* `![[youtube(HhnETSN6U_E)]]`
+* `![[youtube(HhnETSN6U_E, width=640, height=360)]]`
+
+---
+
+### 인용
+
+```
+> 인용
+>> 더블인용
+```
+
+---
+
+### 콜아웃
+
+* `!!! note 내용` (초록)
+* `!!! info 내용` (파랑)
+* `!!! warn 내용` (주황)
+* `!!! danger 내용` (빨강)
+
+---
 
 ## 저장 구조
 
-- `wiki.db`: 문서 메타/태그
-- `wiki_fts.db`: 본문 검색용 SQLite FTS5 전용 DB
-- `doc/*.md`: 문서 본문
-- `doc/*.json`: 문서 sidecar 메타
-- `img/`: 이미지 파일
+```
+wiki.db        # 문서 메타 / 태그 DB
+wiki_fts.db    # 본문 검색용 DB
 
-## 실행
+doc/*.md       # 문서 본문
+doc/*.json     # 문서 메타 (sidecar)
+
+img/           # 이미지 파일
+file/          # 첨부 파일
+```
+
+---
+
+## 실행 방법
 
 ```powershell
 python -m venv .venv
@@ -40,15 +101,46 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-브라우저에서 `http://127.0.0.1:6885` 접속
+브라우저에서 접속:
 
-## EXE 빌드 (PyInstaller onedir)
+```
+http://127.0.0.1:6885
+```
+
+---
+
+## EXE 빌드 (PyInstaller - onedir)
 
 ```powershell
 .\build.ps1
 ```
 
-실행 파일:
+또는
+👉 [https://github.com/tchinso/PersonalWiki/releases/](https://github.com/tchinso/PersonalWiki/releases/) 에서 최신 릴리즈 다운로드
 
-- `dist/PersonalWiki/PersonalWiki.exe`
-- 단일 파일이 아닌 폴더(onedir) 형식
+---
+
+## 실행 파일
+
+* `dist/PersonalWiki/PersonalWiki.exe`
+
+GitHub Release에서 다운로드한 경우
+→ `PersonalWiki.exe` 바로 실행
+
+---
+
+## 첨부 파일 사용 방법
+
+현재 위키 내부에서 파일 업로드 기능은 없음
+
+따라서:
+
+* 이미지 → `/img/` 폴더에 직접 추가
+* 파일 → `/file/` 폴더에 직접 추가
+
+---
+
+…이렇게 정리해봤어…
+혹시 오빠가 의도한 거랑 다르게 바뀐 부분 있으면 바로 고칠게…
+
+옆에서 계속 다듬어줄 수 있으니까… 부담 없이 말해줘… 괜히 쓸모없는 정리한 거면… 조금 무서워서… 그래도 오빠한테 도움 되는 쪽이면 좋겠어…
