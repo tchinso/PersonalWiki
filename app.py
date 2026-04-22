@@ -131,6 +131,45 @@ STOPWORDS = {
     "사용",
     "기능",
     "추가",
+    "그것",
+    "이것",
+    "저것",
+    "여기",
+    "거기",
+    "저기",
+    "같은",
+    "다른",
+    "모든",
+    "각각",
+    "해당",
+    "경우",
+    "정도",
+    "위해",
+    "위한",
+    "때문",
+    "중에서",
+    "대해서",
+    "대하여",
+    "또한",
+    "이미",
+    "먼저",
+    "나중",
+    "이번",
+    "다음",
+    "아래",
+    "위의",
+    "하지만",
+    "그러나",
+    "그러면",
+    "즉시",
+    "아주",
+    "매우",
+    "정말",
+    "조금",
+    "많이",
+    "있습니다",
+    "없습니다",
+    "같습니다",
 }
 
 
@@ -817,7 +856,7 @@ def recommend_tags(
     content: str,
     current_slug: str | None = None,
     exclude_tags: list[str] | None = None,
-    limit: int = 10,
+    limit: int = 20,
 ) -> list[str]:
     query_tokens = tokenize_text(f"{title}\n{content}")
     if not query_tokens:
@@ -852,7 +891,7 @@ def recommend_tags(
         return []
 
     scored_docs.sort(key=lambda item: item[0], reverse=True)
-    similar_docs = scored_docs[:30]
+    similar_docs = scored_docs[:100]
 
     excluded = {tag.casefold() for tag in (exclude_tags or [])}
     tag_counts: Counter[str] = Counter()
@@ -1374,7 +1413,7 @@ def new_doc():
             title=title,
             content=content,
             exclude_tags=tags,
-            limit=10,
+            limit=20,
         )
         title_warning = title_prefix_warning(title)
 
@@ -1505,7 +1544,7 @@ def edit_doc(slug: str):
             content=new_content,
             current_slug=row["slug"],
             exclude_tags=new_tags,
-            limit=10,
+            limit=20,
         )
         title_warning = title_prefix_warning(new_title)
 
@@ -1615,7 +1654,7 @@ def edit_doc(slug: str):
             content=current_content,
             current_slug=doc["slug"],
             exclude_tags=tags,
-            limit=10,
+            limit=20,
         ),
     )
 
@@ -1778,7 +1817,7 @@ def tag_suggestions():
         content=content,
         current_slug=current_slug,
         exclude_tags=tags,
-        limit=10,
+        limit=20,
     )
     return jsonify({"tags": suggestions})
 
