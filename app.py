@@ -170,6 +170,50 @@ STOPWORDS = {
     "있습니다",
     "없습니다",
     "같습니다",
+    "이런",
+    "그런",
+    "저런",
+    "어떤",
+    "누구",
+    "무엇",
+    "어디",
+    "언제",
+    "그래서",
+    "그래도",
+    "따라서",
+    "예를",
+    "예시",
+    "일단",
+    "계속",
+    "현재",
+    "이후",
+    "이전",
+    "전부",
+    "전체",
+    "부분",
+    "대부분",
+    "주요",
+    "기본",
+    "직접",
+    "간접",
+    "가능",
+    "불가능",
+    "필요",
+    "필요한",
+    "있어",
+    "없는",
+    "있고",
+    "없고",
+    "된다",
+    "되는",
+    "하면",
+    "해서",
+    "하고",
+    "한다",
+    "처럼",
+    "보다",
+    "까지",
+    "부터",
 }
 
 
@@ -178,6 +222,11 @@ _TAG_RECOMMEND_CACHE: dict[str, object] = {
     "signature": None,
     "corpus": [],
 }
+TAG_RECOMMEND_IDF_EXPONENT = 2.0
+TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
+TAG_RECOMMEND_LIMIT = 25
+TAG_RECOMMEND_TOP_DOC_PREMIUM_COUNT = 3
+TAG_RECOMMEND_TOP_DOC_PREMIUM_WEIGHT = 3.0
 
 
 def invalidate_tag_recommendation_cache() -> None:
@@ -760,7 +809,8 @@ def build_tfidf_vector(tf_counter: Counter[str], df_counter: Counter[str], total
         if tf <= 0:
             continue
         df = df_counter.get(token, 0)
-        idf = math.log((total_docs + 1) / (df + 1)) + 1
+        idf_base = math.log((total_docs + 1) / (df + 1)) + 1
+        idf = idf_base ** TAG_RECOMMEND_IDF_EXPONENT
         vec[token] = float(tf) * idf
     return vec
 
@@ -856,7 +906,7 @@ def recommend_tags(
     content: str,
     current_slug: str | None = None,
     exclude_tags: list[str] | None = None,
-    limit: int = 20,
+    limit: int = TAG_RECOMMEND_LIMIT,
 ) -> list[str]:
     query_tokens = tokenize_text(f"{title}\n{content}")
     if not query_tokens:
@@ -891,14 +941,17 @@ def recommend_tags(
         return []
 
     scored_docs.sort(key=lambda item: item[0], reverse=True)
-    similar_docs = scored_docs[:100]
+    similar_docs = scored_docs[:TAG_RECOMMEND_SIMILAR_DOC_LIMIT]
 
     excluded = {tag.casefold() for tag in (exclude_tags or [])}
     tag_counts: Counter[str] = Counter()
-    tag_weights: defaultdict[str, float] = defaultdict(float)
+    tag_scores: defaultdict[str, float] = defaultdict(float)
     display_names: dict[str, str] = {}
 
-    for similarity, tags in similar_docs:
+    for index, (similarity, tags) in enumerate(similar_docs):
+        score = similarity
+        if index < TAG_RECOMMEND_TOP_DOC_PREMIUM_COUNT:
+            score *= TAG_RECOMMEND_TOP_DOC_PREMIUM_WEIGHT
         seen_in_doc: set[str] = set()
         for tag in tags:
             key = tag.casefold()
@@ -907,11 +960,11 @@ def recommend_tags(
             seen_in_doc.add(key)
             display_names.setdefault(key, tag)
             tag_counts[key] += 1
-            tag_weights[key] += similarity
+            tag_scores[key] += score
 
     ordered = sorted(
         tag_counts.keys(),
-        key=lambda key: (-tag_counts[key], -tag_weights[key], display_names[key].casefold()),
+        key=lambda key: (-tag_scores[key], -tag_counts[key], display_names[key].casefold()),
     )
     return [display_names[key] for key in ordered[:limit]]
 
@@ -1413,7 +1466,7 @@ def new_doc():
             title=title,
             content=content,
             exclude_tags=tags,
-            limit=20,
+            limit=TAG_RECOMMEND_LIMIT,
         )
         title_warning = title_prefix_warning(title)
 
@@ -1544,7 +1597,7 @@ def edit_doc(slug: str):
             content=new_content,
             current_slug=row["slug"],
             exclude_tags=new_tags,
-            limit=20,
+            limit=TAG_RECOMMEND_LIMIT,
         )
         title_warning = title_prefix_warning(new_title)
 
@@ -1654,7 +1707,7 @@ def edit_doc(slug: str):
             content=current_content,
             current_slug=doc["slug"],
             exclude_tags=tags,
-            limit=20,
+            limit=TAG_RECOMMEND_LIMIT,
         ),
     )
 
@@ -1817,7 +1870,7 @@ def tag_suggestions():
         content=content,
         current_slug=current_slug,
         exclude_tags=tags,
-        limit=20,
+        limit=TAG_RECOMMEND_LIMIT,
     )
     return jsonify({"tags": suggestions})
 
