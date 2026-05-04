@@ -221,18 +221,21 @@ _TAG_RECOMMEND_CACHE_LOCK = threading.Lock()
 _TAG_RECOMMEND_CACHE: dict[str, object] = {
     "signature": None,
     "corpus": [],
+    "df_counter": Counter(),
+    "total_docs": 0,
 }
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
-TAG_RECOMMEND_TOP_DOC_PREMIUM_COUNT = 3
-TAG_RECOMMEND_TOP_DOC_PREMIUM_WEIGHT = 3.0
+TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
 
 
 def invalidate_tag_recommendation_cache() -> None:
     with _TAG_RECOMMEND_CACHE_LOCK:
         _TAG_RECOMMEND_CACHE["signature"] = None
         _TAG_RECOMMEND_CACHE["corpus"] = []
+        _TAG_RECOMMEND_CACHE["df_counter"] = Counter()
+        _TAG_RECOMMEND_CACHE["total_docs"] = 0
 
 
 DIRTY_MTIME_GRACE_SECONDS = 5.0
@@ -254,6 +257,9 @@ class StartupRecoveryNeeded(RuntimeError):
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -20000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -261,6 +267,9 @@ def connect_db() -> sqlite3.Connection:
 def connect_fts_db() -> sqlite3.Connection:
     conn = sqlite3.connect(FTS_DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -20000")
     return conn
 
 
@@ -618,6 +627,12 @@ def title_prefix_warning(title: str) -> str | None:
 
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
+    old_tag_rows = conn.execute(
+        "SELECT tag_id FROM doc_tags WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchall()
+    affected_tag_ids = {int(row["tag_id"]) for row in old_tag_rows}
+
     conn.execute("DELETE FROM doc_tags WHERE doc_id = ?", (doc_id,))
     normalized_tags = parse_tags(",".join(str(tag) for tag in tags))
     if normalized_tags:
@@ -625,39 +640,56 @@ def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None
             "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
             [(tag,) for tag in normalized_tags],
         )
-        name_filters = " OR ".join("name = ? COLLATE NOCASE" for _ in normalized_tags)
+        placeholders = ",".join("?" for _ in normalized_tags)
         tag_rows = conn.execute(
-            f"SELECT id FROM tags WHERE {name_filters}",
+            f"SELECT id FROM tags WHERE name COLLATE NOCASE IN ({placeholders})",
             normalized_tags,
         ).fetchall()
         if tag_rows:
+            affected_tag_ids.update(int(row["id"]) for row in tag_rows)
             conn.executemany(
                 "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
                 [(doc_id, int(row["id"])) for row in tag_rows],
             )
-    conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
+    if affected_tag_ids:
+        placeholders = ",".join("?" for _ in affected_tag_ids)
+        conn.execute(
+            f"""
+            DELETE FROM tags
+            WHERE id IN ({placeholders})
+              AND NOT EXISTS (
+                SELECT 1 FROM doc_tags WHERE doc_tags.tag_id = tags.id
+              )
+            """,
+            list(affected_tag_ids),
+        )
 
 
 def set_doc_references(conn: sqlite3.Connection, doc_id: int, references: dict[str, list[str]]) -> None:
     payload = normalize_reference_payload(references)
     conn.execute("DELETE FROM doc_references WHERE source_doc_id = ?", (doc_id,))
 
+    rows: list[tuple[int, str, str, str, str]] = []
     for ref_type, key in (("link", "links"), ("template", "templates")):
         for raw_target in payload[key]:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO doc_references
-                (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+            rows.append(
                 (
                     doc_id,
                     ref_type,
                     raw_target,
                     reference_title_key(raw_target),
                     slugify(raw_target),
-                ),
+                )
             )
+    if rows:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO doc_references
+            (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
 
 def update_fts(fts_conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
@@ -698,9 +730,17 @@ def resolve_doc_reference(conn: sqlite3.Connection, ref: str) -> str | None:
 
 
 def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
+    reference_cache: dict[str, str | None] = {}
+
+    def resolve_cached(ref: str) -> str | None:
+        key = ref.strip().casefold()
+        if key not in reference_cache:
+            reference_cache[key] = resolve_doc_reference(conn, ref)
+        return reference_cache[key]
+
     html = markdown_engine.render(
         text,
-        resolve_doc_reference=lambda ref: resolve_doc_reference(conn, ref),
+        resolve_doc_reference=resolve_cached,
         read_document=read_document_if_exists,
     )
     return Markup(html)
@@ -815,18 +855,37 @@ def build_tfidf_vector(tf_counter: Counter[str], df_counter: Counter[str], total
     return vec
 
 
-def cosine_similarity(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
+def vector_norm(vec: dict[str, float]) -> float:
+    return math.sqrt(sum(v * v for v in vec.values()))
+
+
+def cosine_similarity(
+    vec_a: dict[str, float],
+    vec_b: dict[str, float],
+    *,
+    norm_a: float | None = None,
+    norm_b: float | None = None,
+) -> float:
     if not vec_a or not vec_b:
         return 0.0
-    common = set(vec_a.keys()) & set(vec_b.keys())
-    if not common:
+    if len(vec_a) <= len(vec_b):
+        numerator = sum(value * vec_b.get(token, 0.0) for token, value in vec_a.items())
+    else:
+        numerator = sum(value * vec_a.get(token, 0.0) for token, value in vec_b.items())
+    if numerator <= 0:
         return 0.0
-    numerator = sum(vec_a[token] * vec_b[token] for token in common)
-    norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
-    norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
+    norm_a = vector_norm(vec_a) if norm_a is None else norm_a
+    norm_b = vector_norm(vec_b) if norm_b is None else norm_b
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return numerator / (norm_a * norm_b)
+
+
+def tag_recommend_rank_weight(rank: int) -> float:
+    base = TAG_RECOMMEND_SIMILAR_DOC_LIMIT + 1 - rank
+    if base <= 0:
+        return 0.0
+    return float(base) ** TAG_RECOMMEND_RANK_WEIGHT_EXPONENT
 
 
 def build_tag_recommendation_signature(
@@ -869,6 +928,8 @@ def build_tag_recommendation_corpus(
         with _TAG_RECOMMEND_CACHE_LOCK:
             _TAG_RECOMMEND_CACHE["signature"] = signature
             _TAG_RECOMMEND_CACHE["corpus"] = []
+            _TAG_RECOMMEND_CACHE["df_counter"] = Counter()
+            _TAG_RECOMMEND_CACHE["total_docs"] = 0
         return []
 
     doc_ids = [int(row["id"]) for row in rows]
@@ -892,9 +953,24 @@ def build_tag_recommendation_corpus(
             }
         )
 
+    df_counter: Counter[str] = Counter()
+    for doc in corpus:
+        for token in doc["token_set"]:
+            df_counter[token] += 1
+
+    total_docs = len(corpus)
+    for doc in corpus:
+        doc_vec = build_tfidf_vector(doc["tf_counter"], df_counter, total_docs)
+        doc["tfidf_vector"] = doc_vec
+        doc["tfidf_norm"] = vector_norm(doc_vec)
+        doc.pop("tf_counter", None)
+        doc.pop("token_set", None)
+
     with _TAG_RECOMMEND_CACHE_LOCK:
         _TAG_RECOMMEND_CACHE["signature"] = signature
         _TAG_RECOMMEND_CACHE["corpus"] = corpus
+        _TAG_RECOMMEND_CACHE["df_counter"] = df_counter
+        _TAG_RECOMMEND_CACHE["total_docs"] = total_docs
     return corpus
 
 
@@ -921,20 +997,30 @@ def recommend_tags(
     if not corpus:
         return []
 
-    df_counter: Counter[str] = Counter()
-    for doc in corpus:
-        for token in doc["token_set"]:
-            df_counter[token] += 1
-
-    total_docs = len(corpus)
+    with _TAG_RECOMMEND_CACHE_LOCK:
+        cached_df_counter = _TAG_RECOMMEND_CACHE.get("df_counter")
+        cached_total_docs = _TAG_RECOMMEND_CACHE.get("total_docs")
+    df_counter = cached_df_counter if isinstance(cached_df_counter, Counter) else Counter()
+    total_docs = cached_total_docs if isinstance(cached_total_docs, int) else len(base_corpus)
     query_vec = build_tfidf_vector(Counter(query_tokens), df_counter, total_docs)
     if not query_vec:
+        return []
+    query_norm = vector_norm(query_vec)
+    if query_norm == 0:
         return []
 
     scored_docs: list[tuple[float, list[str]]] = []
     for doc in corpus:
-        doc_vec = build_tfidf_vector(doc["tf_counter"], df_counter, total_docs)
-        similarity = cosine_similarity(query_vec, doc_vec)
+        doc_vec = doc.get("tfidf_vector")
+        if not isinstance(doc_vec, dict):
+            continue
+        doc_norm = doc.get("tfidf_norm")
+        similarity = cosine_similarity(
+            query_vec,
+            doc_vec,
+            norm_a=query_norm,
+            norm_b=doc_norm if isinstance(doc_norm, float) else None,
+        )
         if similarity > 0:
             scored_docs.append((similarity, list(doc["tags"])))
     if not scored_docs:
@@ -949,9 +1035,8 @@ def recommend_tags(
     display_names: dict[str, str] = {}
 
     for index, (similarity, tags) in enumerate(similar_docs):
-        score = similarity
-        if index < TAG_RECOMMEND_TOP_DOC_PREMIUM_COUNT:
-            score *= TAG_RECOMMEND_TOP_DOC_PREMIUM_WEIGHT
+        rank = index + 1
+        score = similarity * tag_recommend_rank_weight(rank)
         seen_in_doc: set[str] = set()
         for tag in tags:
             key = tag.casefold()
