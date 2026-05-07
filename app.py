@@ -228,6 +228,30 @@ TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
 TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
+TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
+    (500, 120_000),
+    (1_000, 60_000),
+    (1_500, 40_000),
+    (2_000, 30_000),
+    (2_500, 24_000),
+    (3_000, 20_000),
+    (4_000, 15_000),
+    (5_000, 12_000),
+    (6_000, 10_000),
+    (8_000, 7_500),
+    (10_000, 6_000),
+    (15_000, 4_000),
+    (20_000, 3_000),
+    (25_000, 2_400),
+    (30_000, 2_000),
+    (40_000, 1_500),
+    (50_000, 1_200),
+    (60_000, 1_000),
+    (80_000, 750),
+    (100_000, 600),
+    (150_000, 400),
+    (200_000, 300),
+)
 
 
 def invalidate_tag_recommendation_cache() -> None:
@@ -888,6 +912,15 @@ def tag_recommend_rank_weight(rank: int) -> float:
     return float(base) ** TAG_RECOMMEND_RANK_WEIGHT_EXPONENT
 
 
+def get_tag_recommend_corpus_content_cutoff(doc_count: int) -> int | None:
+    cutoff: int | None = None
+    for min_docs, char_limit in TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS:
+        if doc_count < min_docs:
+            break
+        cutoff = char_limit
+    return cutoff
+
+
 def build_tag_recommendation_signature(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
@@ -934,7 +967,14 @@ def build_tag_recommendation_corpus(
 
     doc_ids = [int(row["id"]) for row in rows]
     tag_map = build_doc_tag_map(conn, doc_ids)
-    fts_rows = fts_conn.execute("SELECT rowid AS doc_id, content FROM docs_fts").fetchall()
+    content_cutoff = get_tag_recommend_corpus_content_cutoff(len(rows))
+    if content_cutoff is None:
+        fts_rows = fts_conn.execute("SELECT rowid AS doc_id, content FROM docs_fts").fetchall()
+    else:
+        fts_rows = fts_conn.execute(
+            "SELECT rowid AS doc_id, substr(content, 1, ?) AS content FROM docs_fts",
+            (content_cutoff,),
+        ).fetchall()
     content_map = {int(row["doc_id"]): str(row["content"] or "") for row in fts_rows}
 
     corpus: list[dict[str, object]] = []
