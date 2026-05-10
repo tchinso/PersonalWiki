@@ -19,6 +19,7 @@ def runtime_data_dir() -> Path:
 
 DATA_DIR = runtime_data_dir()
 DOC_DIR = DATA_DIR / "doc"
+JSON_DIR = DOC_DIR / "json"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 
@@ -290,7 +291,7 @@ def write_sidecar(
         "meta": meta,
         "references": normalize_reference_payload(references),
     }
-    sidecar_path = DOC_DIR / f"{slug}.json"
+    sidecar_path = JSON_DIR / f"{slug}.json"
     sidecar_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -317,7 +318,7 @@ def rebuild_from_doc_dir() -> tuple[int, int]:
 
         for md_file in sorted(DOC_DIR.glob("*.md")):
             slug = md_file.stem
-            sidecar = read_json_dict(DOC_DIR / f"{slug}.json")
+            sidecar = read_json_dict(JSON_DIR / f"{slug}.json")
             try:
                 content = read_text_normalized(md_file)
 
@@ -331,7 +332,7 @@ def rebuild_from_doc_dir() -> tuple[int, int]:
 
                 meta_value = sidecar.get("meta")
                 meta = meta_value if isinstance(meta_value, dict) else {}
-                meta["sidecar"] = f"{slug}.json"
+                meta["sidecar"] = f"json/{slug}.json"
 
                 main_conn.execute(
                     """
@@ -379,6 +380,7 @@ def rebuild_from_doc_dir() -> tuple[int, int]:
 
 def recreate_databases() -> tuple[int, int]:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
+    JSON_DIR.mkdir(parents=True, exist_ok=True)
     if DB_PATH.exists():
         DB_PATH.unlink()
     if FTS_DB_PATH.exists():

@@ -46,6 +46,7 @@ def runtime_paths() -> tuple[Path, Path]:
 
 RESOURCE_DIR, DATA_DIR = runtime_paths()
 DOC_DIR = DATA_DIR / "doc"
+JSON_DIR = DOC_DIR / "json"
 IMG_DIR = DATA_DIR / "img"
 FILE_DIR = DATA_DIR / "file"
 DB_PATH = DATA_DIR / "wiki.db"
@@ -324,6 +325,7 @@ def close_db(_error: BaseException | None) -> None:
 
 def init_storage() -> None:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
+    JSON_DIR.mkdir(parents=True, exist_ok=True)
     IMG_DIR.mkdir(parents=True, exist_ok=True)
     FILE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_default_favicon()
@@ -459,7 +461,7 @@ def document_path(slug: str) -> Path:
 
 
 def sidecar_path(slug: str) -> Path:
-    return DOC_DIR / f"{slug}.json"
+    return JSON_DIR / f"{slug}.json"
 
 
 def normalize_newlines(text: str) -> str:
@@ -1294,7 +1296,7 @@ def sync_new_doc(
 
     meta_value = sidecar.get("meta")
     meta = meta_value if isinstance(meta_value, dict) else {}
-    meta["sidecar"] = f"{slug}.json"
+    meta["sidecar"] = f"json/{slug}.json"
 
     conn.execute(
         """
@@ -1350,7 +1352,7 @@ def sync_modified_doc(
         current_title = ensure_unique_title(conn, inferred, exclude_doc_id=doc_id)
 
     meta = safe_load_json(row["meta_json"])
-    meta["sidecar"] = f"{slug}.json"
+    meta["sidecar"] = f"json/{slug}.json"
     updated_at = iso_from_timestamp(mtime)
 
     conn.execute(
@@ -1556,7 +1558,7 @@ def ensure_default_home() -> None:
 예: `flask AND sqlite`, `python NOT django`
 """
         now = now_iso()
-        meta = {"sidecar": f"{slug}.json"}
+        meta = {"sidecar": f"json/{slug}.json"}
         conn.execute(
             """
             INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
@@ -1606,6 +1608,7 @@ def fetch_docs_for_index(conn: sqlite3.Connection) -> list[dict]:
         SELECT id, title, slug, created_at, updated_at
         FROM docs
         ORDER BY updated_at DESC, title COLLATE NOCASE
+        LIMIT 100
         """
     ).fetchall()
     tag_map = build_doc_tag_map(conn, [int(row["id"]) for row in rows])
@@ -1720,7 +1723,7 @@ def new_doc():
 
         slug = ensure_unique_slug(conn, slugify(title))
         created_at = now_iso()
-        meta = {"sidecar": f"{slug}.json"}
+        meta = {"sidecar": f"json/{slug}.json"}
         try:
             conn.execute(
                 """
@@ -1851,7 +1854,7 @@ def edit_doc(slug: str):
 
         updated_at = now_iso()
         meta = safe_load_json(row["meta_json"])
-        meta["sidecar"] = f"{new_slug}.json"
+        meta["sidecar"] = f"json/{new_slug}.json"
         try:
             conn.execute(
                 """
