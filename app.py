@@ -230,7 +230,7 @@ TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
 TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
 TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 200
-TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 12
+TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 30
 TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK = 10
 TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
     (500, 120_000),
@@ -1099,9 +1099,14 @@ def recommend_tags(
         cached_total_docs = _TAG_RECOMMEND_CACHE.get("total_docs")
     df_counter = cached_df_counter if isinstance(cached_df_counter, Counter) else Counter()
     total_docs = cached_total_docs if isinstance(cached_total_docs, int) else len(base_corpus)
+    candidate_query_tokens = [
+        token
+        for token in query_tokens
+        if df_counter.get(token, 0) > 0
+    ]
     candidate_doc_ids = find_tag_recommendation_candidate_doc_ids(
         fts_conn,
-        query_tokens,
+        candidate_query_tokens,
         df_counter,
         total_docs,
     )
