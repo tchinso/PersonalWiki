@@ -228,6 +228,9 @@ TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
 TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
+TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 200
+TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 12
+TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK = 10
 TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
     (500, 120_000),
     (1_000, 60_000),
@@ -921,6 +924,56 @@ def get_tag_recommend_corpus_content_cutoff(doc_count: int) -> int | None:
     return cutoff
 
 
+def escape_fts5_phrase_token(token: str) -> str:
+    return '"' + token.replace('"', '""') + '"'
+
+
+def find_tag_recommendation_candidate_doc_ids(
+    fts_conn: sqlite3.Connection,
+    query_tokens: list[str],
+    df_counter: Counter[str],
+    total_docs: int,
+    *,
+    limit: int = TAG_RECOMMEND_FTS_CANDIDATE_LIMIT,
+) -> set[int]:
+    if not query_tokens or total_docs <= 0 or limit <= 0:
+        return set()
+
+    token_counts = Counter(query_tokens)
+    first_positions: dict[str, int] = {}
+    for index, token in enumerate(query_tokens):
+        first_positions.setdefault(token, index)
+
+    def token_idf(token: str) -> float:
+        df = df_counter.get(token, 0)
+        return math.log((total_docs + 1) / (df + 1)) + 1
+
+    ranked_tokens = sorted(
+        first_positions.keys(),
+        key=lambda token: (-token_idf(token), -token_counts[token], first_positions[token]),
+    )
+    selected_tokens = ranked_tokens[:TAG_RECOMMEND_FTS_MAX_QUERY_TERMS]
+    if not selected_tokens:
+        return set()
+
+    match_query = " OR ".join(escape_fts5_phrase_token(token) for token in selected_tokens)
+    try:
+        rows = fts_conn.execute(
+            """
+            SELECT rowid AS doc_id
+            FROM docs_fts
+            WHERE docs_fts MATCH ?
+            ORDER BY bm25(docs_fts)
+            LIMIT ?
+            """,
+            (match_query, limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+
+    return {int(row["doc_id"]) for row in rows}
+
+
 def build_tag_recommendation_signature(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
@@ -986,7 +1039,9 @@ def build_tag_recommendation_corpus(
         tf_counter = Counter(doc_tokens)
         corpus.append(
             {
+                "doc_id": doc_id,
                 "slug": str(row["slug"]),
+                "title": str(row["title"]),
                 "tags": tag_map.get(doc_id, []),
                 "tf_counter": tf_counter,
                 "token_set": set(tf_counter.keys()),
@@ -1029,12 +1084,12 @@ def recommend_tags(
         return []
 
     base_corpus = build_tag_recommendation_corpus(conn, fts_conn)
-    corpus = [
+    full_corpus = [
         doc
         for doc in base_corpus
         if not current_slug or str(doc["slug"]) != current_slug
     ]
-    if not corpus:
+    if not full_corpus:
         return []
 
     with _TAG_RECOMMEND_CACHE_LOCK:
@@ -1042,17 +1097,39 @@ def recommend_tags(
         cached_total_docs = _TAG_RECOMMEND_CACHE.get("total_docs")
     df_counter = cached_df_counter if isinstance(cached_df_counter, Counter) else Counter()
     total_docs = cached_total_docs if isinstance(cached_total_docs, int) else len(base_corpus)
+    candidate_doc_ids = find_tag_recommendation_candidate_doc_ids(
+        fts_conn,
+        query_tokens,
+        df_counter,
+        total_docs,
+    )
+    corpus = full_corpus
+    if len(candidate_doc_ids) >= TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK:
+        candidate_corpus = [
+            doc
+            for doc in full_corpus
+            if isinstance(doc.get("doc_id"), int) and int(doc["doc_id"]) in candidate_doc_ids
+        ]
+        if candidate_corpus:
+            corpus = candidate_corpus
+
     query_vec = build_tfidf_vector(Counter(query_tokens), df_counter, total_docs)
     if not query_vec:
         return []
     query_norm = vector_norm(query_vec)
     if query_norm == 0:
         return []
+    query_token_set = set(query_vec.keys())
 
     scored_docs: list[tuple[float, list[str]]] = []
     for doc in corpus:
+        tags = list(doc["tags"])
+        if not tags:
+            continue
         doc_vec = doc.get("tfidf_vector")
         if not isinstance(doc_vec, dict):
+            continue
+        if not query_token_set.intersection(doc_vec.keys()):
             continue
         doc_norm = doc.get("tfidf_norm")
         similarity = cosine_similarity(
@@ -1062,7 +1139,7 @@ def recommend_tags(
             norm_b=doc_norm if isinstance(doc_norm, float) else None,
         )
         if similarity > 0:
-            scored_docs.append((similarity, list(doc["tags"])))
+            scored_docs.append((similarity, tags))
     if not scored_docs:
         return []
 
