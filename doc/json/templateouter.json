@@ -1,0 +1,16 @@
+{
+  "title": "templateouter",
+  "slug": "templateouter",
+  "created_at": "2026-04-17T19:11:26",
+  "updated_at": "2026-04-17T19:11:26",
+  "tags": [],
+  "meta": {
+    "sidecar": "json/templateouter.json"
+  },
+  "references": {
+    "links": [],
+    "templates": [
+      "TemplateInner"
+    ]
+  }
+}

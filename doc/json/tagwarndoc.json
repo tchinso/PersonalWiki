@@ -1,0 +1,14 @@
+{
+  "title": "tagwarndoc",
+  "slug": "tagwarndoc",
+  "created_at": "2026-04-17T19:11:26",
+  "updated_at": "2026-04-17T19:11:26",
+  "tags": [],
+  "meta": {
+    "sidecar": "json/tagwarndoc.json"
+  },
+  "references": {
+    "links": [],
+    "templates": []
+  }
+}

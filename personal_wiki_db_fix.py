@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
+import time
 import unicodedata
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +25,8 @@ DOC_DIR = DATA_DIR / "doc"
 JSON_DIR = DOC_DIR / "json"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
+DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
+_DATA_LOCK_FILE = None
 
 
 def iso_from_timestamp(timestamp: float) -> str:
@@ -150,10 +155,79 @@ def reference_title_key(value: str) -> str:
     return normalize_reference_target(value).casefold()
 
 
+def _lock_file_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_data_lock() -> None:
+    global _DATA_LOCK_FILE
+    if _DATA_LOCK_FILE is not None:
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handle = DATA_LOCK_PATH.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        _lock_file_handle(handle)
+    except OSError as error:
+        handle.close()
+        raise RuntimeError(
+            "PersonalWiki가 실행 중이거나 다른 DBFix가 작업 중입니다. "
+            "DB 손상을 막기 위해 이번 복구를 중단합니다."
+        ) from error
+    _DATA_LOCK_FILE = handle
+
+
+def release_data_lock() -> None:
+    global _DATA_LOCK_FILE
+    handle = _DATA_LOCK_FILE
+    if handle is None:
+        return
+    _DATA_LOCK_FILE = None
+    try:
+        _unlock_file_handle(handle)
+    except OSError:
+        pass
+    handle.close()
+
+
+def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool) -> None:
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -20000")
+    if foreign_keys:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def connect_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    configure_sqlite_connection(conn, foreign_keys=True)
     return conn
 
 
@@ -208,6 +282,14 @@ def init_main_db(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_refs_title_lookup "
+        "ON doc_references (target_title_key, source_doc_id, ref_type)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_lookup "
+        "ON doc_references (target_slug_key, source_doc_id, ref_type)"
+    )
     # Legacy cleanup: older versions stored docs_fts in wiki.db.
     conn.execute("DROP TABLE IF EXISTS docs_fts")
 
@@ -222,6 +304,12 @@ def init_fts_db(conn: sqlite3.Connection) -> None:
 
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
+    old_tag_rows = conn.execute(
+        "SELECT tag_id FROM doc_tags WHERE doc_id = ?",
+        (doc_id,),
+    ).fetchall()
+    affected_tag_ids = {int(row["tag_id"]) for row in old_tag_rows}
+
     conn.execute("DELETE FROM doc_tags WHERE doc_id = ?", (doc_id,))
     normalized_tags = parse_tags(",".join(str(tag) for tag in tags))
     if normalized_tags:
@@ -229,31 +317,39 @@ def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None
             "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
             [(tag,) for tag in normalized_tags],
         )
-        name_filters = " OR ".join("name = ? COLLATE NOCASE" for _ in normalized_tags)
+        placeholders = ",".join("?" for _ in normalized_tags)
         rows = conn.execute(
-            f"SELECT id FROM tags WHERE {name_filters}",
+            f"SELECT id FROM tags WHERE name COLLATE NOCASE IN ({placeholders})",
             normalized_tags,
         ).fetchall()
         if rows:
+            affected_tag_ids.update(int(row["id"]) for row in rows)
             conn.executemany(
                 "INSERT OR IGNORE INTO doc_tags (doc_id, tag_id) VALUES (?, ?)",
                 [(doc_id, int(row["id"])) for row in rows],
             )
-    conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM doc_tags)")
+    if affected_tag_ids:
+        placeholders = ",".join("?" for _ in affected_tag_ids)
+        conn.execute(
+            f"""
+            DELETE FROM tags
+            WHERE id IN ({placeholders})
+              AND NOT EXISTS (
+                SELECT 1 FROM doc_tags WHERE doc_tags.tag_id = tags.id
+              )
+            """,
+            list(affected_tag_ids),
+        )
 
 
 def set_doc_references(conn: sqlite3.Connection, doc_id: int, references: dict[str, list[str]]) -> None:
     payload = normalize_reference_payload(references)
     conn.execute("DELETE FROM doc_references WHERE source_doc_id = ?", (doc_id,))
 
+    rows: list[tuple[int, str, str, str, str]] = []
     for ref_type, key in (("link", "links"), ("template", "templates")):
         for raw_target in payload[key]:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO doc_references
-                (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+            rows.append(
                 (
                     doc_id,
                     ref_type,
@@ -262,6 +358,15 @@ def set_doc_references(conn: sqlite3.Connection, doc_id: int, references: dict[s
                     slugify(raw_target),
                 ),
             )
+    if rows:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO doc_references
+            (source_doc_id, ref_type, raw_target, target_title_key, target_slug_key)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
 
 def update_fts(conn: sqlite3.Connection, doc_id: int, title: str, content: str) -> None:
@@ -308,11 +413,69 @@ def collect_sidecar_tags(sidecar: dict) -> list[str]:
     return []
 
 
-def rebuild_from_doc_dir() -> tuple[int, int]:
+def sqlite_related_paths(path: Path) -> list[Path]:
+    return [
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+    ]
+
+
+def remove_sqlite_family(path: Path) -> None:
+    for related in sqlite_related_paths(path):
+        if related.exists():
+            related.unlink()
+
+
+def move_existing_sqlite_family(path: Path, backup_dir: Path) -> list[tuple[Path, Path]]:
+    moved: list[tuple[Path, Path]] = []
+    for related in sqlite_related_paths(path):
+        if not related.exists():
+            continue
+        target = backup_dir / related.name
+        related.replace(target)
+        moved.append((target, related))
+    return moved
+
+
+def restore_sqlite_backups(moved: list[tuple[Path, Path]]) -> None:
+    for backup, original in reversed(moved):
+        if backup.exists() and not original.exists():
+            backup.replace(original)
+
+
+def replace_databases_from_temp(temp_main: Path, temp_fts: Path) -> Path:
+    backup_dir = DATA_DIR / "db_backups" / time.strftime("%Y%m%d-%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[tuple[Path, Path]] = []
+    replaced: list[Path] = []
+
+    try:
+        moved.extend(move_existing_sqlite_family(DB_PATH, backup_dir))
+        moved.extend(move_existing_sqlite_family(FTS_DB_PATH, backup_dir))
+
+        temp_main.replace(DB_PATH)
+        replaced.append(DB_PATH)
+        temp_fts.replace(FTS_DB_PATH)
+        replaced.append(FTS_DB_PATH)
+
+        remove_sqlite_family(temp_main)
+        remove_sqlite_family(temp_fts)
+        return backup_dir
+    except Exception:
+        for path in replaced:
+            if path.exists():
+                path.unlink()
+        restore_sqlite_backups(moved)
+        raise
+
+
+def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path) -> tuple[int, int]:
     imported = 0
     skipped = 0
 
-    with connect_db(DB_PATH) as main_conn, connect_db(FTS_DB_PATH) as fts_conn:
+    with closing(connect_db(main_db_path)) as main_conn, closing(connect_db(fts_db_path)) as fts_conn:
         init_main_db(main_conn)
         init_fts_db(fts_conn)
 
@@ -381,11 +544,21 @@ def rebuild_from_doc_dir() -> tuple[int, int]:
 def recreate_databases() -> tuple[int, int]:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
-    if DB_PATH.exists():
-        DB_PATH.unlink()
-    if FTS_DB_PATH.exists():
-        FTS_DB_PATH.unlink()
-    return rebuild_from_doc_dir()
+
+    temp_main = DATA_DIR / "wiki.rebuild.db"
+    temp_fts = DATA_DIR / "wiki_fts.rebuild.db"
+    remove_sqlite_family(temp_main)
+    remove_sqlite_family(temp_fts)
+
+    try:
+        imported, skipped = rebuild_from_doc_dir(temp_main, temp_fts)
+    except Exception:
+        remove_sqlite_family(temp_main)
+        remove_sqlite_family(temp_fts)
+        raise
+    backup_dir = replace_databases_from_temp(temp_main, temp_fts)
+    print(f"[OK] previous DB backup: {backup_dir}")
+    return imported, skipped
 
 
 def main() -> int:
@@ -396,7 +569,11 @@ def main() -> int:
     print(f"FTS DB: {FTS_DB_PATH}")
 
     try:
-        imported, skipped = recreate_databases()
+        acquire_data_lock()
+        try:
+            imported, skipped = recreate_databases()
+        finally:
+            release_data_lock()
     except Exception as error:
         print(f"[ERROR] failed to rebuild databases: {error}")
         return 1

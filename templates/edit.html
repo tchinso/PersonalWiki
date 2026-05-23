@@ -24,8 +24,27 @@
   {% if tag_warning %}
     <p class="warning">{{ tag_warning }}</p>
   {% endif %}
+  {% if spell_warning %}
+    <p class="warning">{{ spell_warning }}</p>
+    {% if spellcheck_samples %}
+      <ul class="spellcheck-samples">
+        {% for sample in spellcheck_samples %}
+          <li>
+            <strong>{{ sample.field }}</strong>:
+            <code>{{ sample.wrong }}</code>
+            &rarr;
+            <code>{{ sample.replace }}</code>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endif %}
 
   <form method="post" class="edit-form" data-current-slug="{{ doc.slug or '' }}">
+    {% if ignore_tag_warning %}
+      <input type="hidden" name="ignore_tag_warning" value="1">
+    {% endif %}
+
     <label for="title">제목</label>
     <input id="title" name="title" type="text" value="{{ doc.title }}" required>
 
@@ -60,6 +79,14 @@
 
     <div class="button-row">
       <button class="button" type="submit">저장</button>
+      {% if show_spellcheck_warning %}
+        <button class="button secondary" type="submit" name="spellcheck_action" value="auto_fix">
+          자동수정하고 저장
+        </button>
+        <button class="button secondary" type="submit" name="spellcheck_action" value="save_as_is">
+          이대로 저장
+        </button>
+      {% endif %}
       {% if mode == "new" and show_ignore_tag_warning %}
         <button class="button secondary" type="submit" name="ignore_tag_warning" value="1">
           경고 무시하고 생성

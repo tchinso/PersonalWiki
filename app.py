@@ -2,6 +2,8 @@
 
 import json
 import math
+import atexit
+import os
 import re
 import shutil
 import sqlite3
@@ -9,7 +11,8 @@ import subprocess
 import sys
 import threading
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from contextlib import closing
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -51,8 +54,10 @@ IMG_DIR = DATA_DIR / "img"
 FILE_DIR = DATA_DIR / "file"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
+DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 TEMPLATE_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
+_DATA_LOCK_FILE = None
 
 
 app = Flask(
@@ -232,15 +237,40 @@ TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
 TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 200
 TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 30
 TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK = 10
+SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
+TAG_RECOMMEND_CUTOFF_START_DOCS = 100
+TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS = 6_000
+TAG_RECOMMEND_CUTOFF_STEP = 100
+TAG_RECOMMEND_CUTOFF_START_BUDGET = 120_000_000
+TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET = 60_000_000
+
+
+def _tag_recommend_budget_for_doc_count(doc_count: int) -> int:
+    if doc_count <= TAG_RECOMMEND_CUTOFF_START_DOCS:
+        return TAG_RECOMMEND_CUTOFF_START_BUDGET
+    if doc_count >= TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS:
+        return TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET
+
+    span = TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS - TAG_RECOMMEND_CUTOFF_START_DOCS
+    used = doc_count - TAG_RECOMMEND_CUTOFF_START_DOCS
+    budget_drop = TAG_RECOMMEND_CUTOFF_START_BUDGET - TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET
+    return TAG_RECOMMEND_CUTOFF_START_BUDGET - ((budget_drop * used) // span)
+
+
+def _tag_recommend_cutoff_for_doc_count(doc_count: int) -> int:
+    return max(1, _tag_recommend_budget_for_doc_count(doc_count) // max(doc_count, 1))
+
+
 TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
-    (500, 120_000),
-    (1_000, 60_000),
-    (1_500, 40_000),
-    (2_000, 30_000),
-    (2_500, 24_000),
-    (3_000, 20_000),
-    (4_000, 15_000),
-    (5_000, 12_000),
+    (1, _tag_recommend_cutoff_for_doc_count(100)),
+    *(
+        (_doc_count, _tag_recommend_cutoff_for_doc_count(_doc_count))
+        for _doc_count in range(
+            TAG_RECOMMEND_CUTOFF_START_DOCS,
+            TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS,
+            TAG_RECOMMEND_CUTOFF_STEP,
+        )
+    ),
     (6_000, 10_000),
     (8_000, 7_500),
     (10_000, 6_000),
@@ -256,6 +286,132 @@ TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
     (150_000, 400),
     (200_000, 300),
 )
+
+KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
+    ("오래동안", "오랫동안"),
+    ("오랜동안", "오랫동안"),
+    ("다행이도", "다행히도"),
+    ("받아드리", "받아들이"),
+    ("뒤집혀졌", "뒤집혔"),
+    ("그럴 수 밖에", "그럴 수밖에"),
+    ("어느정도", "어느 정도"),
+    ("이를 테면", "이를테면"),
+    ("등장 인물", "등장인물"),
+    ("못지 않다", "못지않다"),
+    ("아무 것", "아무것"),
+    ("오래 전", "오래전"),
+    ("갯수", "개수"),
+    ("곰곰히", "곰곰이"),
+    ("기여코", "기어코"),
+    ("깨끗히", "깨끗이"),
+    ("나날히", "나날이"),
+    ("다행이", "다행히"),
+    ("누누히", "누누이"),
+    ("일일히", "일일이"),
+    ("줄줄히", "줄줄이"),
+    ("넉넉치", "넉넉지"),
+    ("녹록치", "녹록지"),
+    ("익숙치", "익숙지"),
+    ("짐작케", "짐작게"),
+    ("탐탁찮", "탐탁잖"),
+    ("탐탁치", "탐탁지"),
+    ("노랑색", "노란색"),
+    ("빨강색", "빨간색"),
+    ("파랑색", "파란색"),
+    ("검정색", "검은색"),
+    ("높혀", "높여"),
+    ("높혔", "높였"),
+    ("높힐", "높일"),
+    ("붙혀", "붙여"),
+    ("붙혔", "붙였"),
+    ("붙힐", "붙일"),
+    ("다싶이", "다시피"),
+    ("대려가", "데려가"),
+    ("대리고", "데리고"),
+    ("댓가", "대가"),
+    ("되야", "돼야"),
+    ("되버", "돼 버"),
+    ("되있", "돼있"),
+    ("되서", "돼서"),
+    ("바꼈", "바뀌었"),
+    ("보여지", "보이"),
+    ("불리우", "불리"),
+    ("불리운", "불린"),
+    ("불리웠", "불렸"),
+    ("불리울", "불릴"),
+    ("불리워", "불려"),
+    ("본따", "본떠"),
+    ("본딴", "본뜬"),
+    ("실날", "실낱"),
+    ("스폐셜", "스페셜"),
+    ("알맞는", "알맞은"),
+    ("여러므로", "여러모로"),
+    ("주서", "주워"),
+    ("쯤음", "즈음"),
+    ("치루는", "치르는"),
+    ("치룰", "치를"),
+    ("치뤘", "치렀"),
+    ("치뤄", "치러"),
+    ("치룸", "치름"),
+    ("치루게", "치르게"),
+    ("치루고", "치르고"),
+    ("치루기", "치르기"),
+    ("치루지", "치르지"),
+    ("치루며", "치르며"),
+    ("치루면", "치르면"),
+    ("치루던", "치르던"),
+    ("치루려", "치르려"),
+    ("치루었", "치렀"),
+    ("치루어", "치러"),
+    ("치뤄져", "치러져"),
+    ("표효", "포효"),
+    ("헛점", "허점"),
+    ("할려", "하려"),
+    ("죽을려", "죽으려"),
+    ("패쇄", "폐쇄"),
+    ("폐쇠", "폐쇄"),
+    ("아니였", "아니었"),
+    ("햇갈", "헷갈"),
+    ("쓸때", "쓸데"),
+    ("들어나는", "드러나는"),
+    ("들어나면", "드러나면"),
+    ("든줄", "든 줄"),
+    ("따음표", "따옴표"),
+    ("왠만", "웬만"),
+    ("걸맞는", "걸맞은"),
+    ("건내다", "건네다"),
+    ("과부화", "과부하"),
+    ("꺼려하다", "꺼리다"),
+    ("대체제", "대체재"),
+    ("말빨", "말발"),
+    ("화장빨", "화장발"),
+    ("약빨", "약발"),
+    ("배끼다", "베끼다"),
+    ("배풀다", "베풀다"),
+    ("잇점", "이점"),
+    ("가디건", "카디건"),
+    ("나레이션", "내레이션"),
+    ("넌센스", "난센스"),
+    ("데미지", "대미지"),
+    ("라이센스", "라이선스"),
+    ("레포트", "리포트"),
+    ("메세지", "메시지"),
+    ("샤베트", "셔벗"),
+    ("세레모니", "세리머니"),
+    ("알콜", "알코올"),
+    ("앙케이트", "앙케트"),
+    ("앵콜", "앙코르"),
+    ("어플", "앱"),
+    ("엘레베이터", "엘리베이터"),
+    ("타겟", "타깃"),
+    ("타란튤라", "타란툴라"),
+    ("헐리우드", "할리우드"),
+    ("헐리웃", "할리우드"),
+    ("랍퍼", "래퍼"),
+    ("런닝", "러닝"),
+    ("썸머", "서머"),
+)
+KOREAN_SPELL_SAMPLE_LIMIT = 8
 
 
 def invalidate_tag_recommendation_cache() -> None:
@@ -282,22 +438,91 @@ class StartupRecoveryNeeded(RuntimeError):
     pass
 
 
+def _lock_file_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_data_lock() -> None:
+    global _DATA_LOCK_FILE
+    if _DATA_LOCK_FILE is not None:
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handle = DATA_LOCK_PATH.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        _lock_file_handle(handle)
+    except OSError as error:
+        handle.close()
+        raise RuntimeError(
+            "PersonalWiki 데이터베이스가 이미 다른 프로세스에서 사용 중입니다. "
+            "실행 중인 PersonalWiki 또는 DBFix를 종료한 뒤 다시 시작해 주세요."
+        ) from error
+
+    _DATA_LOCK_FILE = handle
+    atexit.register(release_data_lock)
+
+
+def release_data_lock() -> None:
+    global _DATA_LOCK_FILE
+    handle = _DATA_LOCK_FILE
+    if handle is None:
+        return
+    _DATA_LOCK_FILE = None
+    try:
+        _unlock_file_handle(handle)
+    except OSError:
+        pass
+    handle.close()
+
+
+def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool) -> None:
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -20000")
+    if foreign_keys:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA temp_store = MEMORY")
-    conn.execute("PRAGMA cache_size = -20000")
-    conn.execute("PRAGMA foreign_keys = ON")
+    configure_sqlite_connection(conn, foreign_keys=True)
     return conn
 
 
 def connect_fts_db() -> sqlite3.Connection:
     conn = sqlite3.connect(FTS_DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA temp_store = MEMORY")
-    conn.execute("PRAGMA cache_size = -20000")
+    configure_sqlite_connection(conn, foreign_keys=False)
     return conn
 
 
@@ -343,7 +568,7 @@ def ensure_default_favicon() -> None:
 
 
 def init_db() -> None:
-    with connect_db() as conn:
+    with closing(connect_db()) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS docs (
@@ -394,18 +619,28 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_refs_title_lookup "
+            "ON doc_references (target_title_key, source_doc_id, ref_type)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_lookup "
+            "ON doc_references (target_slug_key, source_doc_id, ref_type)"
+        )
         # Legacy cleanup: older versions stored docs_fts in wiki.db.
         conn.execute("DROP TABLE IF EXISTS docs_fts")
+        conn.commit()
 
 
 def init_fts_db() -> None:
-    with connect_fts_db() as conn:
+    with closing(connect_fts_db()) as conn:
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts
             USING fts5(title, content)
             """
         )
+        conn.commit()
 
 
 def safe_load_json(raw: str) -> dict:
@@ -495,6 +730,30 @@ def read_document_if_exists(slug: str) -> str | None:
 def write_document(slug: str, content: str) -> None:
     normalized = normalize_newlines(content)
     document_path(slug).write_text(normalized, encoding="utf-8", newline="\n")
+
+
+def move_document_assets_for_slug_change(old_slug: str, new_slug: str) -> list[tuple[Path, Path]]:
+    moved: list[tuple[Path, Path]] = []
+    for old_path, new_path in (
+        (document_path(old_slug), document_path(new_slug)),
+        (sidecar_path(old_slug), sidecar_path(new_slug)),
+    ):
+        if not old_path.exists():
+            continue
+        if new_path.exists():
+            raise FileExistsError(f"target document asset already exists: {new_path}")
+        old_path.rename(new_path)
+        moved.append((old_path, new_path))
+    return moved
+
+
+def rollback_document_asset_moves(moved: list[tuple[Path, Path]]) -> None:
+    for old_path, new_path in reversed(moved):
+        try:
+            if new_path.exists() and not old_path.exists():
+                new_path.rename(old_path)
+        except OSError as error:
+            print(f"[WARN] failed to rollback document asset move {new_path} -> {old_path}: {error}")
 
 
 def load_sidecar(slug: str) -> dict:
@@ -655,6 +914,146 @@ def title_prefix_warning(title: str) -> str | None:
     return None
 
 
+KOREAN_SPELL_REPLACEMENTS = dict(KOREAN_SPELL_REPLACE_DB)
+
+
+def build_korean_spell_automaton(
+    pairs: tuple[tuple[str, str], ...],
+) -> tuple[list[dict[str, int]], list[int], list[list[str]]]:
+    transitions: list[dict[str, int]] = [{}]
+    failure_links: list[int] = [0]
+    outputs: list[list[str]] = [[]]
+
+    for wrong, _replace in pairs:
+        if not wrong:
+            continue
+        state = 0
+        for char in wrong:
+            next_state = transitions[state].get(char)
+            if next_state is None:
+                next_state = len(transitions)
+                transitions[state][char] = next_state
+                transitions.append({})
+                failure_links.append(0)
+                outputs.append([])
+            state = next_state
+        outputs[state].append(wrong)
+
+    queue: deque[int] = deque(transitions[0].values())
+    while queue:
+        state = queue.popleft()
+        for char, next_state in transitions[state].items():
+            queue.append(next_state)
+            fallback = failure_links[state]
+            while fallback and char not in transitions[fallback]:
+                fallback = failure_links[fallback]
+            failure_links[next_state] = transitions[fallback].get(char, 0)
+            outputs[next_state].extend(outputs[failure_links[next_state]])
+
+    return transitions, failure_links, outputs
+
+
+@lru_cache(maxsize=1)
+def get_korean_spell_automaton() -> tuple[list[dict[str, int]], list[int], list[list[str]]]:
+    return build_korean_spell_automaton(KOREAN_SPELL_REPLACE_DB)
+
+
+def iter_korean_spell_matches(text: str):
+    if not text:
+        return
+
+    transitions, failure_links, outputs = get_korean_spell_automaton()
+    state = 0
+    for index, char in enumerate(text):
+        while state and char not in transitions[state]:
+            state = failure_links[state]
+        state = transitions[state].get(char, 0)
+        for wrong in outputs[state]:
+            start = index - len(wrong) + 1
+            yield start, index + 1, wrong, KOREAN_SPELL_REPLACEMENTS[wrong]
+
+
+def select_korean_spell_replacements(text: str) -> list[tuple[int, int, str, str]]:
+    matches = list(iter_korean_spell_matches(text))
+    if not matches:
+        return []
+
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    selected: list[tuple[int, int, str, str]] = []
+    cursor = 0
+    for start, end, wrong, replace in matches:
+        if start < cursor:
+            continue
+        selected.append((start, end, wrong, replace))
+        cursor = end
+    return selected
+
+
+def collect_korean_spell_issues(title: str, content: str) -> dict[str, object] | None:
+    count = 0
+    samples: list[dict[str, str]] = []
+    sampled: set[tuple[str, str, str]] = set()
+
+    for field_label, text in (("제목", title), ("본문", content)):
+        for _start, _end, wrong, replace in select_korean_spell_replacements(text):
+            count += 1
+            sample_key = (field_label, wrong, replace)
+            if len(samples) >= KOREAN_SPELL_SAMPLE_LIMIT or sample_key in sampled:
+                continue
+            sampled.add(sample_key)
+            samples.append(
+                {
+                    "field": field_label,
+                    "wrong": wrong,
+                    "replace": replace,
+                }
+            )
+
+    if count == 0:
+        return None
+    return {
+        "count": count,
+        "samples": samples,
+    }
+
+
+def apply_korean_spell_replacements(text: str) -> str:
+    matches = select_korean_spell_replacements(text)
+    if not matches:
+        return text
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, _wrong, replace in matches:
+        parts.append(text[cursor:start])
+        parts.append(replace)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def apply_korean_spell_autofix(title: str, content: str) -> tuple[str, str]:
+    return (
+        apply_korean_spell_replacements(title).strip(),
+        apply_korean_spell_replacements(content),
+    )
+
+
+def korean_spell_warning_message(issue_count: object) -> str:
+    return (
+        f"맞춤법 자동교정 후보 {issue_count}곳을 찾았습니다. "
+        "자동수정하고 저장하거나, 수정하지 않고 이대로 저장할 수 있습니다."
+    )
+
+
+def render_edit_form(**context):
+    context.setdefault("spell_warning", None)
+    context.setdefault("show_spellcheck_warning", False)
+    context.setdefault("spellcheck_samples", [])
+    context.setdefault("ignore_tag_warning", False)
+    return render_template("edit.html", **context)
+
+
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
     old_tag_rows = conn.execute(
         "SELECT tag_id FROM doc_tags WHERE doc_id = ?",
@@ -758,8 +1157,63 @@ def resolve_doc_reference(conn: sqlite3.Connection, ref: str) -> str | None:
     return None
 
 
+def iter_sqlite_chunks(values: list[str], size: int = SQLITE_IN_CLAUSE_CHUNK_SIZE):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def bulk_resolve_doc_references(conn: sqlite3.Connection, refs: list[str]) -> dict[str, str | None]:
+    lookups: list[str] = []
+    lookup_keys: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        lookup = ref.strip()
+        if not lookup:
+            continue
+        key = lookup.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        lookups.append(lookup)
+        lookup_keys.append(key)
+
+    if not lookups:
+        return {}
+
+    resolved: dict[str, str | None] = {key: None for key in lookup_keys}
+    for chunk in iter_sqlite_chunks(lookups):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT title, slug FROM docs WHERE title COLLATE NOCASE IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            resolved[str(row["title"]).strip().casefold()] = str(row["slug"])
+
+    slug_to_keys: defaultdict[str, list[str]] = defaultdict(list)
+    for lookup, key in zip(lookups, lookup_keys):
+        if resolved.get(key):
+            continue
+        slug_to_keys[slugify(lookup).casefold()].append(key)
+
+    slug_lookups = list(slug_to_keys.keys())
+    for chunk in iter_sqlite_chunks(slug_lookups):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT slug FROM docs WHERE slug COLLATE NOCASE IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            slug = str(row["slug"])
+            for key in slug_to_keys.get(slug.casefold(), []):
+                resolved[key] = slug
+
+    return resolved
+
+
 def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
-    reference_cache: dict[str, str | None] = {}
+    wiki_refs, template_refs = extract_reference_targets(text)
+    reference_cache = bulk_resolve_doc_references(conn, [*wiki_refs, *template_refs])
 
     def resolve_cached(ref: str) -> str | None:
         key = ref.strip().casefold()
@@ -1020,24 +1474,20 @@ def build_tag_recommendation_corpus(
             _TAG_RECOMMEND_CACHE["total_docs"] = 0
         return []
 
-    doc_ids = [int(row["id"]) for row in rows]
+    doc_meta_by_id = {int(row["id"]): row for row in rows}
+    doc_ids = list(doc_meta_by_id.keys())
     tag_map = build_doc_tag_map(conn, doc_ids)
     content_cutoff = get_tag_recommend_corpus_content_cutoff(len(rows))
-    if content_cutoff is None:
-        fts_rows = fts_conn.execute("SELECT rowid AS doc_id, content FROM docs_fts").fetchall()
-    else:
-        fts_rows = fts_conn.execute(
-            "SELECT rowid AS doc_id, substr(content, 1, ?) AS content FROM docs_fts",
-            (content_cutoff,),
-        ).fetchall()
-    content_map = {int(row["doc_id"]): str(row["content"] or "") for row in fts_rows}
-
+    seen_fts_doc_ids: set[int] = set()
     corpus: list[dict[str, object]] = []
-    for row in rows:
-        doc_id = int(row["id"])
-        doc_tokens = tokenize_text(f"{row['title']}\n{content_map.get(doc_id, '')}")
+
+    def append_corpus_doc(doc_id: int, content: str) -> None:
+        row = doc_meta_by_id.get(doc_id)
+        if row is None:
+            return
+        doc_tokens = tokenize_text(f"{row['title']}\n{content}")
         if not doc_tokens:
-            continue
+            return
         tf_counter = Counter(doc_tokens)
         corpus.append(
             {
@@ -1049,6 +1499,23 @@ def build_tag_recommendation_corpus(
                 "token_set": set(tf_counter.keys()),
             }
         )
+
+    if content_cutoff is None:
+        fts_cursor = fts_conn.execute("SELECT rowid AS doc_id, content FROM docs_fts")
+    else:
+        fts_cursor = fts_conn.execute(
+            "SELECT rowid AS doc_id, substr(content, 1, ?) AS content FROM docs_fts",
+            (content_cutoff,),
+        )
+
+    for fts_row in fts_cursor:
+        doc_id = int(fts_row["doc_id"])
+        seen_fts_doc_ids.add(doc_id)
+        append_corpus_doc(doc_id, str(fts_row["content"] or ""))
+
+    for doc_id in doc_ids:
+        if doc_id not in seen_fts_doc_ids:
+            append_corpus_doc(doc_id, "")
 
     df_counter: Counter[str] = Counter()
     for doc in corpus:
@@ -1188,6 +1655,15 @@ def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
 
     rows = conn.execute(
         """
+        WITH matched_refs AS (
+            SELECT source_doc_id, ref_type
+            FROM doc_references
+            WHERE target_title_key = ?
+            UNION ALL
+            SELECT source_doc_id, ref_type
+            FROM doc_references
+            WHERE target_slug_key = ?
+        )
         SELECT
             d.id,
             d.title,
@@ -1195,14 +1671,13 @@ def find_backlinks(conn: sqlite3.Connection, target_slug: str) -> list[dict]:
             d.updated_at,
             MAX(CASE WHEN r.ref_type = 'link' THEN 1 ELSE 0 END) AS has_link,
             MAX(CASE WHEN r.ref_type = 'template' THEN 1 ELSE 0 END) AS has_template
-        FROM doc_references r
+        FROM matched_refs r
         JOIN docs d ON d.id = r.source_doc_id
         WHERE d.slug != ?
-          AND (r.target_title_key = ? OR r.target_slug_key = ?)
         GROUP BY d.id, d.title, d.slug, d.updated_at
         ORDER BY d.updated_at DESC, d.title COLLATE NOCASE
         """,
-        (target_slug, title_key, slug_key),
+        (title_key, slug_key, target_slug),
     ).fetchall()
 
     backlinks: list[dict] = []
@@ -1417,7 +1892,7 @@ def repair_fts_mismatch(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) 
 
 
 def sync_documents_incremental() -> dict[str, int]:
-    with connect_db() as conn, connect_fts_db() as fts_conn:
+    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn:
         md_snapshot = build_markdown_snapshot()
         db_snapshot = build_db_snapshot(conn)
         new_slugs, deleted_slugs, modified_slugs = detect_incremental_changes(md_snapshot, db_snapshot)
@@ -1449,12 +1924,7 @@ def sync_documents_incremental() -> dict[str, int]:
         for slug in deleted_slugs:
             sync_deleted_doc(conn, fts_conn, row=db_snapshot[slug])
 
-        docs_count = int(conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"])
-        fts_count = int(fts_conn.execute("SELECT COUNT(*) AS c FROM docs_fts").fetchone()["c"])
-        fts_missing = 0
-        fts_orphan = 0
-        if docs_count != fts_count:
-            fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn)
+        fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn)
 
         conn.commit()
         fts_conn.commit()
@@ -1531,13 +2001,19 @@ def sync_documents_on_startup() -> None:
     except sqlite3.DatabaseError as error:
         reason = f"database error: {error}"
 
-    if not run_db_fix_tool(reason):
+    release_data_lock()
+    try:
+        db_fix_ok = run_db_fix_tool(reason)
+    finally:
+        acquire_data_lock()
+
+    if not db_fix_ok:
         raise RuntimeError(f"startup sync failed and DB fix did not complete: {reason}")
     print("[SYNC] Startup recovery completed by PersonalWikiDBFix.")
 
 
 def ensure_default_home() -> None:
-    with connect_db() as conn, connect_fts_db() as fts_conn:
+    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"]
         if count > 0:
             return
@@ -1594,6 +2070,8 @@ def ensure_default_home() -> None:
             meta=meta,
             references=references,
         )
+        conn.commit()
+        fts_conn.commit()
         invalidate_tag_recommendation_cache()
 
 
@@ -1670,19 +2148,24 @@ def new_doc():
         content = normalize_newlines(request.form.get("content", ""))
         tags = parse_tags(request.form.get("tags", ""))
         ignore_tag_warning = request.form.get("ignore_tag_warning") == "1"
-        suggested_tags = recommend_tags(
-            conn,
-            fts_conn,
-            title=title,
-            content=content,
-            exclude_tags=tags,
-            limit=TAG_RECOMMEND_LIMIT,
-        )
+        spellcheck_action = request.form.get("spellcheck_action", "")
+        if spellcheck_action == "auto_fix":
+            title, content = apply_korean_spell_autofix(title, content)
+
+        def suggested_tags_for_form() -> list[str]:
+            return recommend_tags(
+                conn,
+                fts_conn,
+                title=title,
+                content=content,
+                exclude_tags=tags,
+                limit=TAG_RECOMMEND_LIMIT,
+            )
+
         title_warning = title_prefix_warning(title)
 
         if not title:
-            return render_template(
-                "edit.html",
+            return render_edit_form(
                 mode="new",
                 doc={"title": "", "slug": ""},
                 content=content,
@@ -1691,7 +2174,7 @@ def new_doc():
                 tag_warning=None,
                 title_warning=title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags,
+                recommended_tags=suggested_tags_for_form(),
             )
 
         duplicate = conn.execute(
@@ -1699,8 +2182,7 @@ def new_doc():
             (title,),
         ).fetchone()
         if duplicate:
-            return render_template(
-                "edit.html",
+            return render_edit_form(
                 mode="new",
                 doc={"title": title, "slug": ""},
                 content=content,
@@ -1709,12 +2191,11 @@ def new_doc():
                 tag_warning=None,
                 title_warning=title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags,
+                recommended_tags=suggested_tags_for_form(),
             )
 
         if len(tags) < 2 and not ignore_tag_warning:
-            return render_template(
-                "edit.html",
+            return render_edit_form(
                 mode="new",
                 doc={"title": title, "slug": ""},
                 content=content,
@@ -1723,8 +2204,27 @@ def new_doc():
                 tag_warning="태그를 2개 이상 등록하면 나중에 검색이 더 쉬워집니다. 계속 생성하려면 아래 버튼을 눌러 주세요.",
                 title_warning=title_warning,
                 show_ignore_tag_warning=True,
-                recommended_tags=suggested_tags,
+                recommended_tags=suggested_tags_for_form(),
             )
+
+        if spellcheck_action not in {"auto_fix", "save_as_is"}:
+            spell_issues = collect_korean_spell_issues(title, content)
+            if spell_issues:
+                return render_edit_form(
+                    mode="new",
+                    doc={"title": title, "slug": ""},
+                    content=content,
+                    tags_text=", ".join(tags),
+                    error=None,
+                    tag_warning=None,
+                    title_warning=title_warning,
+                    show_ignore_tag_warning=False,
+                    ignore_tag_warning=ignore_tag_warning,
+                    spell_warning=korean_spell_warning_message(spell_issues["count"]),
+                    show_spellcheck_warning=True,
+                    spellcheck_samples=spell_issues["samples"],
+                    recommended_tags=suggested_tags_for_form(),
+                )
 
         slug = ensure_unique_slug(conn, slugify(title))
         created_at = now_iso()
@@ -1770,8 +2270,7 @@ def new_doc():
         return redirect(url_for("view_doc", slug=slug))
 
     prefilled_title = request.args.get("title", "").strip()
-    return render_template(
-        "edit.html",
+    return render_edit_form(
         mode="new",
         doc={"title": prefilled_title, "slug": ""},
         content="",
@@ -1800,20 +2299,25 @@ def edit_doc(slug: str):
         new_title = request.form.get("title", "").strip()
         new_content = normalize_newlines(request.form.get("content", ""))
         new_tags = parse_tags(request.form.get("tags", ""))
-        suggested_tags = recommend_tags(
-            conn,
-            fts_conn,
-            title=new_title or row["title"],
-            content=new_content,
-            current_slug=row["slug"],
-            exclude_tags=new_tags,
-            limit=TAG_RECOMMEND_LIMIT,
-        )
+        spellcheck_action = request.form.get("spellcheck_action", "")
+        if spellcheck_action == "auto_fix":
+            new_title, new_content = apply_korean_spell_autofix(new_title, new_content)
+
+        def suggested_tags_for_form() -> list[str]:
+            return recommend_tags(
+                conn,
+                fts_conn,
+                title=new_title or row["title"],
+                content=new_content,
+                current_slug=row["slug"],
+                exclude_tags=new_tags,
+                limit=TAG_RECOMMEND_LIMIT,
+            )
+
         title_warning = title_prefix_warning(new_title)
 
         if not new_title:
-            return render_template(
-                "edit.html",
+            return render_edit_form(
                 mode="edit",
                 doc=doc,
                 content=new_content,
@@ -1822,7 +2326,7 @@ def edit_doc(slug: str):
                 tag_warning=None,
                 title_warning=title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags,
+                recommended_tags=suggested_tags_for_form(),
             )
 
         duplicate = conn.execute(
@@ -1830,8 +2334,7 @@ def edit_doc(slug: str):
             (new_title, row["id"]),
         ).fetchone()
         if duplicate:
-            return render_template(
-                "edit.html",
+            return render_edit_form(
                 mode="edit",
                 doc=doc,
                 content=new_content,
@@ -1840,27 +2343,38 @@ def edit_doc(slug: str):
                 tag_warning=None,
                 title_warning=title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags,
+                recommended_tags=suggested_tags_for_form(),
             )
+
+        if spellcheck_action not in {"auto_fix", "save_as_is"}:
+            spell_issues = collect_korean_spell_issues(new_title, new_content)
+            if spell_issues:
+                return render_edit_form(
+                    mode="edit",
+                    doc=doc,
+                    content=new_content,
+                    tags_text=", ".join(new_tags),
+                    error=None,
+                    tag_warning=None,
+                    title_warning=title_warning,
+                    show_ignore_tag_warning=False,
+                    spell_warning=korean_spell_warning_message(spell_issues["count"]),
+                    show_spellcheck_warning=True,
+                    spellcheck_samples=spell_issues["samples"],
+                    recommended_tags=suggested_tags_for_form(),
+                )
 
         new_slug_candidate = slugify(new_title)
         new_slug = ensure_unique_slug(conn, new_slug_candidate, exclude_doc_id=row["id"])
         old_slug = row["slug"]
 
-        if new_slug != old_slug:
-            old_md = document_path(old_slug)
-            new_md = document_path(new_slug)
-            if old_md.exists():
-                old_md.rename(new_md)
-            old_json = sidecar_path(old_slug)
-            new_json = sidecar_path(new_slug)
-            if old_json.exists():
-                old_json.rename(new_json)
-
         updated_at = now_iso()
         meta = safe_load_json(row["meta_json"])
         meta["sidecar"] = f"json/{new_slug}.json"
+        moved_assets: list[tuple[Path, Path]] = []
         try:
+            if new_slug != old_slug:
+                moved_assets = move_document_assets_for_slug_change(old_slug, new_slug)
             conn.execute(
                 """
                 UPDATE docs
@@ -1896,12 +2410,12 @@ def edit_doc(slug: str):
         except Exception:
             conn.rollback()
             fts_conn.rollback()
+            rollback_document_asset_moves(moved_assets)
             raise
         return redirect(url_for("view_doc", slug=new_slug))
 
     doc["tags"] = tags
-    return render_template(
-        "edit.html",
+    return render_edit_form(
         mode="edit",
         doc=doc,
         content=current_content,
@@ -2102,6 +2616,7 @@ def favicon():
 
 def bootstrap() -> None:
     init_storage()
+    acquire_data_lock()
     init_db()
     init_fts_db()
     sync_documents_on_startup()
