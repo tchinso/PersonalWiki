@@ -139,3 +139,5 @@ GitHub Release에서 다운로드한 경우
 * 파일 → `/file/` 폴더에 직접 추가
 
 ---
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tchinso/PersonalWiki)
