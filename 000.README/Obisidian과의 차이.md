@@ -28,6 +28,15 @@
  
 `||{{템플릿테스트}}||`
 
+## 표 가로폭 조절 지원
+* Obsidian
+
+지원하지 않음
+* PersonalWiki
+
+하이픈(-)의 개수에 따른 가로폭 비율 지원
+
+
 # Obsidian과 호환됨
 
 ## Obsidian Web Clipper
