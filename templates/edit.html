@@ -64,17 +64,61 @@
       ></div>
     </section>
 
-    <label for="content">Markdown 내용 (GFM)</label>
+    <div class="editor-head">
+      <label for="content">Markdown 내용 (GFM)</label>
+      <button class="button secondary" type="button" id="preview-jump-btn">미리보기로 이동</button>
+    </div>
     <textarea id="content" name="content" rows="18" required>{{ content }}</textarea>
 
-    <div class="hint">
-      문서 링크: <code>[[문서명]]</code>,
-      파일 링크: <code>[[file/happy.zip]]</code>,
-      하이라이트: <code>==강조==</code>,
-      스포일러: <code>||숨김||</code>,
-      유튜브: <code>![[youtube(HhnETSN6U_E, width=640, height=360)]]</code>,
-      템플릿: <code>{{ "{{템플릿문서}}" }}</code>,
-      콜아웃: <code>!!! note 내용</code>
+    <div class="hint wiki-syntax-hint" aria-label="위키 문법 예시">
+      <button type="button" class="syntax-copy" data-copy="*기울임*" title="클릭해서 복사">
+        <span>기울임</span><code>*기울임*</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="**진하게**" title="클릭해서 복사">
+        <span>진하게</span><code>**진하게**</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="~~취소선~~" title="클릭해서 복사">
+        <span>취소선</span><code>~~취소선~~</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="&gt; 인용문" title="클릭해서 복사">
+        <span>인용</span><code>&gt; 인용문</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="&gt;&gt; 더블인용문" title="클릭해서 복사">
+        <span>더블인용</span><code>&gt;&gt; 더블인용문</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="`코드`" title="클릭해서 복사">
+        <span>코드블럭</span><code>`코드`</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="```&#10;여러 줄 코드&#10;```" title="클릭해서 복사">
+        <span>여러줄코드블럭</span><code>```&#10;여러 줄 코드&#10;```</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="![[youtube(영상ID, width=가로폭, height=세로높이, start=시간)]]" title="클릭해서 복사">
+        <span>유튜브</span><code>![[youtube(영상ID, width=가로폭, height=세로높이, start=시간)]]</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="[[문서명|표시 텍스트]]" title="클릭해서 복사">
+        <span>문서 링크</span><code>[[문서명|표시 텍스트]]</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="![[이미지이름, width=가로폭, height=세로높이]]" title="클릭해서 복사">
+        <span>이미지</span><code>![[이미지이름, width=가로폭, height=세로높이]]</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="[[file/파일명]]" title="클릭해서 복사">
+        <span>파일 링크</span><code>[[file/파일명]]</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="{% raw %}||{{접힌템플릿}}||{% endraw %}" title="클릭해서 복사">
+        <span>접힌 템플릿</span><code>{% raw %}||{{접힌템플릿}}||{% endraw %}</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="==강조==" title="클릭해서 복사">
+        <span>하이라이트</span><code>==강조==</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="||숨김||" title="클릭해서 복사">
+        <span>스포일러</span><code>||숨김||</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="{% raw %}{{템플릿문서}}{% endraw %}" title="클릭해서 복사">
+        <span>템플릿</span><code>{% raw %}{{템플릿문서}}{% endraw %}</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="!!! note 내용" title="클릭해서 복사">
+        <span>콜아웃</span><code>!!! note 내용</code>
+      </button>
     </div>
 
     <div class="button-row">
@@ -96,7 +140,7 @@
   </form>
 </section>
 
-<section class="panel">
+<section class="panel" id="preview-panel">
   <h2>미리보기</h2>
   <article id="preview" class="markdown-body"></article>
 </section>

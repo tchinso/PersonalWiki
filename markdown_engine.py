@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 import mistune
 from mistune import BlockState, InlineState, Markdown
+from mistune.plugins import table as mistune_table
 from mistune.util import escape_url
 
 WIKI_LINK_RE = re.compile(r"(?<!\!)\[\[([^\[\]]+)\]\]")
@@ -18,6 +19,7 @@ YOUTUBE_RE = re.compile(r"^youtube\((.*)\)$", flags=re.IGNORECASE)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 EXTERNAL_WIKI_TARGET_RE = re.compile(r"^(https?|file)://", flags=re.IGNORECASE)
 FILE_WIKI_TARGET_RE = re.compile(r"^file/", flags=re.IGNORECASE)
+TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?(?P<dashes>-{3,}):?$")
 
 WIKI_CONTEXT_KEY = "personal_wiki_context"
 TEMPLATE_DISABLED_KEY = "personal_wiki_template_disabled"
@@ -31,17 +33,6 @@ def _is_file_wiki_target(target: str) -> bool:
     return FILE_WIKI_TARGET_RE.match(target.strip()) is not None
 
 
-def _parse_dimension(value: str, default: int) -> int:
-    if not value.isdigit():
-        return default
-    parsed = int(value)
-    if parsed < 120:
-        return 120
-    if parsed > 3840:
-        return 3840
-    return parsed
-
-
 def _parse_dimension_option(value: str) -> int | None:
     cleaned = value.strip().rstrip(")")
     if not cleaned.isdigit():
@@ -52,6 +43,47 @@ def _parse_dimension_option(value: str) -> int | None:
     if parsed > 3840:
         return 3840
     return parsed
+
+
+def _parse_timestamp(value: str) -> int | None:
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        return int(cleaned)
+
+    parts = cleaned.split(":")
+    if 2 <= len(parts) <= 3 and all(part.isdigit() for part in parts):
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(part)
+        return seconds
+    return None
+
+
+def _youtube_height_from_width(width: int) -> int:
+    return max(1, round(width * 9 / 16))
+
+
+def _youtube_width_from_height(height: int) -> int:
+    return max(1, round(height * 16 / 9))
+
+
+def _table_column_widths(align: str, expected_columns: int) -> list[int] | None:
+    cells = mistune_table.CELL_SPLIT.split(align)
+    if len(cells) != expected_columns:
+        return None
+
+    widths: list[int] = []
+    for cell in cells:
+        match = TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
+        if not match:
+            return None
+        widths.append(len(match.group("dashes")))
+
+    if all(width == 3 for width in widths):
+        return None
+    return widths
 
 
 def extract_reference_targets(text: str) -> tuple[list[str], list[str]]:
@@ -87,6 +119,18 @@ class WikiRenderContext:
 
 
 class PersonalWikiRenderer(mistune.HTMLRenderer):
+    def table(self, text: str, column_widths: list[int] | None = None) -> str:
+        colgroup = ""
+        if column_widths:
+            total = sum(column_widths)
+            if total > 0:
+                cols = "".join(
+                    f'  <col style="width: {width / total * 100:.6g}%">\n'
+                    for width in column_widths
+                )
+                colgroup = f"<colgroup>\n{cols}</colgroup>\n"
+        return "<table>\n" + colgroup + text + "</table>\n"
+
     def callout(self, text: str, level: str) -> str:
         return f'<div class="callout callout-{level}"><strong>{level.upper()}</strong> {text}</div>\n'
 
@@ -196,18 +240,36 @@ def _render_youtube(raw: str) -> str | None:
         safe_id = html.escape(video_id)
         return _blockquote_message(f"Invalid youtube video id: {safe_id}")
 
-    width = 560
-    height = 315
+    width: int | None = None
+    height: int | None = None
+    start: int | None = None
     for option in parts[1:]:
         if "=" not in option:
             continue
         key, value = [item.strip().lower() for item in option.split("=", 1)]
+        parsed_dimension = _parse_dimension_option(value)
         if key == "width":
-            width = _parse_dimension(value, width)
+            if parsed_dimension is not None:
+                width = parsed_dimension
         elif key == "height":
-            height = _parse_dimension(value, height)
+            if parsed_dimension is not None:
+                height = parsed_dimension
+        elif key == "start":
+            parsed_start = _parse_timestamp(value)
+            if parsed_start is not None and parsed_start >= 0:
+                start = parsed_start
+
+    if width is None and height is None:
+        width = 560
+        height = 315
+    elif width is None:
+        width = _youtube_width_from_height(height)
+    elif height is None:
+        height = _youtube_height_from_width(width)
 
     src = f"https://www.youtube.com/embed/{quote(video_id)}"
+    if start is not None:
+        src += f"?start={start}"
     return (
         '<div class="youtube-embed">'
         f'<iframe width="{width}" height="{height}" src="{src}" '
@@ -407,6 +469,78 @@ def _parse_folded_template_inline(
     return match.end()
 
 
+def _parse_table(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
+    header = match.group("table_head")
+    align = match.group("table_align")
+    thead, aligns = mistune_table._process_thead(header, align)
+    if not thead or aligns is None:
+        return None
+
+    column_widths = _table_column_widths(align, len(aligns))
+    if column_widths is None and any(
+        not TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
+        for cell in mistune_table.CELL_SPLIT.split(align)
+    ):
+        return None
+
+    rows = []
+    body = match.group("table_body")
+    for text in body.splitlines():
+        cell_match = mistune_table.TABLE_CELL.match(text)
+        if not cell_match:
+            return None
+        row = mistune_table._process_row(cell_match.group(1), aligns)
+        if not row:
+            return None
+        rows.append(row)
+
+    token: dict[str, object] = {
+        "type": "table",
+        "children": [thead, {"type": "table_body", "children": rows}],
+    }
+    if column_widths:
+        token["attrs"] = {"column_widths": column_widths}
+    state.append_token(token)
+    return match.end()
+
+
+def _parse_nptable(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
+    header = match.group("nptable_head")
+    align = match.group("nptable_align")
+    thead, aligns = mistune_table._process_thead(header, align)
+    if not thead or aligns is None:
+        return None
+
+    column_widths = _table_column_widths(align, len(aligns))
+    if column_widths is None and any(
+        not TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
+        for cell in mistune_table.CELL_SPLIT.split(align)
+    ):
+        return None
+
+    rows = []
+    body = match.group("nptable_body")
+    for text in body.splitlines():
+        row = mistune_table._process_row(text, aligns)
+        if not row:
+            return None
+        rows.append(row)
+
+    token: dict[str, object] = {
+        "type": "table",
+        "children": [thead, {"type": "table_body", "children": rows}],
+    }
+    if column_widths:
+        token["attrs"] = {"column_widths": column_widths}
+    state.append_token(token)
+    return match.end()
+
+
+def personal_wiki_table(md: Markdown) -> None:
+    md.block.register("table", mistune_table.TABLE_PATTERN, _parse_table, before="paragraph")
+    md.block.register("nptable", mistune_table.NP_TABLE_PATTERN, _parse_nptable, before="paragraph")
+
+
 def personal_wiki_syntax(md: Markdown) -> None:
     md.block.register(
         "folded_template_block",
@@ -476,7 +610,15 @@ class MarkdownEngine:
         self.markdown = mistune.create_markdown(
             escape=False,
             renderer=PersonalWikiRenderer(escape=False),
-            plugins=["strikethrough", "table", "task_lists", "url", "footnotes", personal_wiki_syntax],
+            plugins=[
+                "strikethrough",
+                "table",
+                personal_wiki_table,
+                "task_lists",
+                "url",
+                "footnotes",
+                personal_wiki_syntax,
+            ],
         )
 
     def render(

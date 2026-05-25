@@ -216,9 +216,71 @@ textarea {
   line-height: 1.45;
 }
 
+.editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+#preview-panel {
+  scroll-margin-top: 76px;
+}
+
 .hint {
   color: var(--muted);
   font-size: 0.92rem;
+}
+
+.wiki-syntax-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.syntax-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  border: 1px solid #cbd8e6;
+  background: #f8fbff;
+  color: #263445;
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 0.86rem;
+  text-align: left;
+}
+
+.syntax-copy:hover {
+  background: #eef6ff;
+}
+
+.syntax-copy span {
+  flex: 0 0 auto;
+  color: #53657a;
+  font-weight: 600;
+}
+
+.syntax-copy code {
+  max-width: min(520px, 100%);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.syntax-copy.copied {
+  border-color: #0f766e;
+  background: #ecf7f6;
+}
+
+.syntax-copy.copied::after {
+  content: "복사됨";
+  flex: 0 0 auto;
+  color: #0f766e;
+  font-weight: 700;
 }
 
 .button-row {

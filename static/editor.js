@@ -5,6 +5,8 @@
   const tagsInput = document.getElementById("tags");
   const suggestionWrap = document.getElementById("tag-suggestions");
   const suggestButton = document.getElementById("suggest-tags-btn");
+  const previewJumpButton = document.getElementById("preview-jump-btn");
+  const previewPanel = document.getElementById("preview-panel");
   const editForm = document.querySelector(".edit-form");
   const titleWarning = document.getElementById("title-link-warning");
   const currentSlug = editForm ? editForm.dataset.currentSlug || "" : "";
@@ -64,6 +66,61 @@
     titleWarning.hidden = !shouldWarn;
     if (shouldWarn && !titleWarning.textContent.trim()) {
       titleWarning.textContent = titleWarning.dataset.warningMessage || "";
+    }
+  }
+
+  function copyWithFallback(text) {
+    const helper = document.createElement("textarea");
+    helper.value = text;
+    helper.setAttribute("readonly", "");
+    helper.style.position = "fixed";
+    helper.style.top = "-1000px";
+    helper.style.left = "-1000px";
+    document.body.appendChild(helper);
+    helper.select();
+
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (_error) {
+      copied = false;
+    } finally {
+      document.body.removeChild(helper);
+    }
+    return copied;
+  }
+
+  async function copyText(text) {
+    if (!text) {
+      return false;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (_error) {
+        return copyWithFallback(text);
+      }
+    }
+    return copyWithFallback(text);
+  }
+
+  function setupSyntaxCopyButtons() {
+    const buttons = document.querySelectorAll(".syntax-copy");
+    for (const button of buttons) {
+      button.addEventListener("click", async () => {
+        const fallback = button.querySelector("code");
+        const text = button.dataset.copy || (fallback ? fallback.textContent : "");
+        const copied = await copyText(text);
+        if (!copied) {
+          return;
+        }
+
+        button.classList.add("copied");
+        window.setTimeout(() => {
+          button.classList.remove("copied");
+        }, 1200);
+      });
     }
   }
 
@@ -158,6 +215,15 @@
     }
   }
 
+  async function jumpToPreview() {
+    clearTimeout(previewTimer);
+    await renderPreview();
+    const target = previewPanel || preview;
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
   if (textarea && preview) {
     textarea.addEventListener("input", () => {
       clearTimeout(previewTimer);
@@ -190,6 +256,12 @@
   if (suggestButton) {
     suggestButton.addEventListener("click", requestTagSuggestions);
   }
+
+  if (previewJumpButton) {
+    previewJumpButton.addEventListener("click", jumpToPreview);
+  }
+
+  setupSyntaxCopyButtons();
 
   if (suggestionWrap) {
     try {
