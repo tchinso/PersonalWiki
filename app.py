@@ -69,8 +69,9 @@ app.config["JSON_AS_ASCII"] = False
 
 markdown_engine = MarkdownEngine()
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9가-힣]{2,}")
-STOPWORDS = {
+ENGLISH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{2,}(?![A-Za-z0-9])")
+KOREAN_TOKEN_RE = re.compile(r"[가-힣]{2,}")
+ENGLISH_STOPWORDS = {
     "the",
     "a",
     "an",
@@ -121,6 +122,8 @@ STOPWORDS = {
     "what",
     "why",
     "how",
+}
+KOREAN_STOPWORDS = {
     "문서",
     "내용",
     "그리고",
@@ -220,7 +223,10 @@ STOPWORDS = {
     "보다",
     "까지",
     "부터",
+    "을",
+    "를",
 }
+KOREAN_STOPWORDS_LONGEST_FIRST = tuple(sorted(KOREAN_STOPWORDS, key=lambda word: (-len(word), word)))
 
 
 _TAG_RECOMMEND_CACHE_LOCK = threading.Lock()
@@ -366,6 +372,10 @@ KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
     ("치뤄져", "치러져"),
     ("표효", "포효"),
     ("헛점", "허점"),
+    ("프롬포트", "프롬프트"),
+    ("옳바", "올바"),
+    ("확율", "확률"),
+    ("유렵", "유럽"),
     ("할려", "하려"),
     ("죽을려", "죽으려"),
     ("패쇄", "폐쇄"),
@@ -377,6 +387,7 @@ KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
     ("들어나면", "드러나면"),
     ("든줄", "든 줄"),
     ("따음표", "따옴표"),
+    ("떄", "때"),
     ("왠만", "웬만"),
     ("걸맞는", "걸맞은"),
     ("건내다", "건네다"),
@@ -395,7 +406,10 @@ KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
     ("데미지", "대미지"),
     ("라이센스", "라이선스"),
     ("레포트", "리포트"),
+    ("메뉴얼", "매뉴얼"),
     ("메세지", "메시지"),
+    ("네비게이", "내비게이"),
+    ("패널티", "페널티"),
     ("샤베트", "셔벗"),
     ("세레모니", "세리머니"),
     ("알콜", "알코올"),
@@ -409,6 +423,11 @@ KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
     ("헐리웃", "할리우드"),
     ("랍퍼", "래퍼"),
     ("런닝", "러닝"),
+    ("쎄다", "세다"),
+    ("쎄고", "세고"),
+    ("쎄지", "세지"),
+    ("쎄진", "세진"),
+    ("쎄게", "세게"),
     ("썸머", "서머"),
 )
 KOREAN_SPELL_SAMPLE_LIMIT = 8
@@ -1312,12 +1331,26 @@ def singularize_token(token: str) -> str:
     return token
 
 
+def remove_korean_stopwords_aggressively(text: str) -> str:
+    for stopword in KOREAN_STOPWORDS_LONGEST_FIRST:
+        text = text.replace(stopword, "")
+    return text
+
+
 def tokenize_text(text: str) -> list[str]:
     tokens: list[str] = []
-    for raw in TOKEN_RE.findall(text.lower()):
+    lowered = text.lower()
+
+    for raw in ENGLISH_TOKEN_RE.findall(lowered):
         token = singularize_token(raw)
-        if token in STOPWORDS:
+        if token in ENGLISH_STOPWORDS:
             continue
+        if len(token) < 2:
+            continue
+        tokens.append(token)
+
+    korean_cleaned = remove_korean_stopwords_aggressively(lowered)
+    for token in KOREAN_TOKEN_RE.findall(korean_cleaned):
         if len(token) < 2:
             continue
         tokens.append(token)
