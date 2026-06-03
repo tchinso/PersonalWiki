@@ -4,12 +4,17 @@
 
 {% block content %}
 <section class="panel">
-  <h1>태그: #{{ tag_name }}</h1>
-  <p class="muted">문서 {{ docs|length }}건</p>
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Tag</p>
+      <h1>태그: #{{ tag_name }}</h1>
+    </div>
+    <p class="muted">문서 {{ docs|length }}건</p>
+  </header>
   {% if docs %}
     <ul class="doc-list">
       {% for doc in docs %}
-        <li class="doc-item">
+        <li class="doc-item tone-{{ loop.cycle('pink', 'teal', 'lavender', 'peach', 'ochre', 'cream') }}">
           <div class="doc-head">
             <a class="doc-title" href="{{ url_for('view_doc', slug=doc.slug) }}">{{ doc.title }}</a>
             <span class="doc-time">{{ doc.updated_at|pretty_time }}</span>
@@ -18,7 +23,9 @@
       {% endfor %}
     </ul>
   {% else %}
-    <p>해당 태그를 가진 문서가 없습니다.</p>
+    <div class="empty-state">
+      <p>해당 태그를 가진 문서가 없습니다.</p>
+    </div>
   {% endif %}
 </section>
 {% endblock %}

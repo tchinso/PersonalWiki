@@ -10,7 +10,12 @@
 
 {% block content %}
 <section class="panel">
-  <h1>{{ page_title }}</h1>
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Editor</p>
+      <h1>{{ page_title }}</h1>
+    </div>
+  </header>
   {% if error %}
     <p class="error">{{ error }}</p>
   {% endif %}
@@ -66,11 +71,14 @@
 
     <div class="editor-head">
       <label for="content">Markdown 내용 (GFM)</label>
-      <button class="button secondary" type="button" id="preview-jump-btn">미리보기로 이동</button>
     </div>
     <textarea id="content" name="content" rows="18" required>{{ content }}</textarea>
 
     <div class="hint wiki-syntax-hint" aria-label="위키 문법 예시">
+      <button class="button secondary wiki-syntax-jump" type="button" id="preview-jump-btn">최하단으로 이동</button>
+      <button type="button" class="syntax-copy" data-copy="&lt;br&gt;" title="클릭해서 복사">
+        <span>표 안쪽 줄바꿈</span><code>&lt;br&gt;</code>
+      </button>
       <button type="button" class="syntax-copy" data-copy="*기울임*" title="클릭해서 복사">
         <span>기울임</span><code>*기울임*</code>
       </button>
@@ -141,8 +149,16 @@
 </section>
 
 <section class="panel" id="preview-panel">
-  <h2>미리보기</h2>
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Preview</p>
+      <h2>미리보기</h2>
+    </div>
+  </header>
   <article id="preview" class="markdown-body"></article>
+  <div class="preview-bottom-actions">
+    <button class="button secondary" type="button" id="editor-jump-btn">편집화면으로 이동</button>
+  </div>
 </section>
 {% endblock %}
 

@@ -6,7 +6,9 @@
   const suggestionWrap = document.getElementById("tag-suggestions");
   const suggestButton = document.getElementById("suggest-tags-btn");
   const previewJumpButton = document.getElementById("preview-jump-btn");
+  const editorJumpButton = document.getElementById("editor-jump-btn");
   const previewPanel = document.getElementById("preview-panel");
+  const previewBottomActions = document.querySelector(".preview-bottom-actions");
   const editForm = document.querySelector(".edit-form");
   const titleWarning = document.getElementById("title-link-warning");
   const currentSlug = editForm ? editForm.dataset.currentSlug || "" : "";
@@ -215,13 +217,21 @@
     }
   }
 
-  async function jumpToPreview() {
+  async function jumpToPreviewBottom() {
     clearTimeout(previewTimer);
     await renderPreview();
-    const target = previewPanel || preview;
+    const target = previewBottomActions || previewPanel || preview;
     if (target) {
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      target.scrollIntoView({ behavior: "smooth", block: "end" });
     }
+  }
+
+  function jumpToEditor() {
+    if (!textarea) {
+      return;
+    }
+    textarea.scrollIntoView({ behavior: "smooth", block: "start" });
+    textarea.focus({ preventScroll: true });
   }
 
   if (textarea && preview) {
@@ -258,7 +268,11 @@
   }
 
   if (previewJumpButton) {
-    previewJumpButton.addEventListener("click", jumpToPreview);
+    previewJumpButton.addEventListener("click", jumpToPreviewBottom);
+  }
+
+  if (editorJumpButton) {
+    editorJumpButton.addEventListener("click", jumpToEditor);
   }
 
   setupSyntaxCopyButtons();

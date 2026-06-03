@@ -3,13 +3,17 @@
 {% block title %}문서 목록 | Personal Wiki{% endblock %}
 
 {% block content %}
-<section class="panel">
-  <h1>문서 목록</h1>
-  <p class="muted">문서 수: {{ docs|length }}</p>
+<section class="panel panel-strong">
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Library</p>
+      <h2>문서 목록</h2>
+    </div>
+  </header>
   {% if docs %}
     <ul class="doc-list">
       {% for doc in docs %}
-        <li class="doc-item">
+        <li class="doc-item tone-{{ loop.cycle('pink', 'teal', 'lavender', 'peach', 'ochre', 'cream') }}">
           <div class="doc-head">
             <a class="doc-title" href="{{ url_for('view_doc', slug=doc.slug) }}">{{ doc.title }}</a>
             <span class="doc-time">{{ doc.updated_at|pretty_time }}</span>
@@ -25,7 +29,9 @@
       {% endfor %}
     </ul>
   {% else %}
-    <p>아직 문서가 없습니다. <a href="{{ url_for('new_doc') }}">첫 문서 만들기</a></p>
+    <div class="empty-state">
+      <p>아직 문서가 없습니다. <a href="{{ url_for('new_doc') }}">첫 문서 만들기</a></p>
+    </div>
   {% endif %}
 </section>
 {% endblock %}

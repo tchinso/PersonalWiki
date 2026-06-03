@@ -9,10 +9,13 @@
     <script src="{{ url_for('static', filename='wiki.js') }}" defer></script>
     {% block extra_head %}{% endblock %}
   </head>
-  <body>
+  <body class="app-shell page-{{ request.endpoint|default('wiki') }}">
     <header class="topbar">
       <div class="topbar-inner">
-        <a class="brand" href="{{ url_for('index') }}">Personal Wiki</a>
+        <a class="brand" href="{{ url_for('index') }}">
+          <img class="brand-mark" src="{{ url_for('serve_image', filename='icon.ico') }}" alt="" aria-hidden="true">
+          <span>Personal Wiki</span>
+        </a>
         <nav class="menu">
           <a href="{{ url_for('index') }}">문서 목록</a>
           <a href="{{ url_for('new_doc') }}">새 문서</a>

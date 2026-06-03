@@ -6,6 +6,7 @@
 <section class="panel">
   <header class="doc-header">
     <div>
+      <p class="eyebrow">Document</p>
       <h1>{{ doc.title }}</h1>
       <p class="muted">
         생성: {{ doc.created_at|pretty_time }} /
@@ -29,13 +30,18 @@
   <article class="markdown-body">{{ rendered }}</article>
 </section>
 
-<section class="panel">
-  <h2>Backlinks</h2>
-  <p class="muted">이 문서를 링크하거나 템플릿으로 참조한 문서 목록입니다.</p>
+<section class="panel panel-strong">
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">References</p>
+      <h2>Backlinks</h2>
+    </div>
+    <p class="muted">링크 또는 템플릿 참조</p>
+  </header>
   {% if backlinks %}
     <ul class="doc-list">
       {% for item in backlinks %}
-        <li class="doc-item">
+        <li class="doc-item tone-{{ loop.cycle('pink', 'teal', 'lavender', 'peach', 'ochre', 'cream') }}">
           <div class="doc-head">
             <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
             <span class="doc-time">{{ item.updated_at|pretty_time }}</span>
@@ -52,7 +58,9 @@
       {% endfor %}
     </ul>
   {% else %}
-    <p>아직 이 문서를 참조한 문서가 없습니다.</p>
+    <div class="empty-state">
+      <p>아직 이 문서를 참조한 문서가 없습니다.</p>
+    </div>
   {% endif %}
 </section>
 {% endblock %}

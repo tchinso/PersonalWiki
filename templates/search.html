@@ -4,21 +4,28 @@
 
 {% block content %}
 <section class="panel">
-  <h1>검색</h1>
-  <p class="muted">제목 + 본문 + 태그 통합 검색, 연산자: <code>AND</code> <code>OR</code> <code>NOT</code></p>
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Search</p>
+      <h1>검색</h1>
+    </div>
+    <p class="muted"><code>AND</code> <code>OR</code> <code>NOT</code></p>
+  </header>
 
   {% if error %}
     <p class="error">{{ error }}</p>
   {% endif %}
 
   {% if query %}
-    <p>검색어: <strong>{{ query }}</strong></p>
+    <p>검색어: <span class="query-pill">{{ query }}</span></p>
     <p class="muted">결과 {{ results|length }}건</p>
     {% if results %}
       <ul class="doc-list">
         {% for item in results %}
-          <li class="doc-item">
-            <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
+          <li class="doc-item tone-{{ loop.cycle('pink', 'teal', 'lavender', 'peach', 'ochre', 'cream') }}">
+            <div class="doc-head">
+              <a class="doc-title" href="{{ url_for('view_doc', slug=item.slug) }}">{{ item.title }}</a>
+            </div>
             {% if item.excerpt %}
               <p class="excerpt">{{ item.excerpt|safe }}</p>
             {% endif %}
@@ -33,10 +40,14 @@
         {% endfor %}
       </ul>
     {% else %}
-      <p>검색 결과가 없습니다.</p>
+      <div class="empty-state">
+        <p>검색 결과가 없습니다.</p>
+      </div>
     {% endif %}
   {% else %}
-    <p>상단 검색창에서 검색어를 입력해 주세요.</p>
+    <div class="empty-state">
+      <p>상단 검색창에서 검색어를 입력해 주세요.</p>
+    </div>
   {% endif %}
 </section>
 {% endblock %}
