@@ -62,6 +62,46 @@ ENGLISH_STOPWORDS = {
     "what",
     "why",
     "how",
+    "img",
+    "file",
+    "http",
+    "https",
+    "br",
+    "youtube",
+    "width",
+    "height",
+    "info",
+    "warn",
+    "danger",
+    "note",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "avif",
+    "gif",
+    "zip",
+    "rar",
+    "7z",
+    "mp3",
+    "mp4",
+    "m4a",
+    "mkv",
+    "bat",
+    "ps1",
+    "html",
+    "mhtml",
+    "htm",
+    "com",
+    "net",
+    "org",
+    "www",
+    "co",
+    "kr",
+    "exe",
+    "jp",
+    "gov",
+    "edu",
 }
 KOREAN_STOPWORDS = {
     "문서",
@@ -558,12 +598,22 @@ def remove_korean_stopwords_aggressively(text: str) -> str:
     return text
 
 
+def is_low_value_numeric_token(token: str) -> bool:
+    return token.isdigit() and len(token) <= 4
+
+
+def is_korean_token(token: str) -> bool:
+    return KOREAN_TOKEN_RE.fullmatch(token) is not None
+
+
 def tokenize_text(text: str) -> list[str]:
     tokens: list[str] = []
     lowered = text.lower()
 
     for raw in ENGLISH_TOKEN_RE.findall(lowered):
         token = singularize_token(raw)
+        if is_low_value_numeric_token(token):
+            continue
         if token in ENGLISH_STOPWORDS:
             continue
         if len(token) < 2:
@@ -600,7 +650,19 @@ def compute_tag_recommendation_idf(total_docs: int, df: int) -> float:
 def limit_tf_counter(tf_counter: Counter[str], max_tokens: int) -> Counter[str]:
     if max_tokens <= 0 or len(tf_counter) <= max_tokens:
         return tf_counter
-    return Counter(dict(tf_counter.most_common(max_tokens)))
+    token_order = {token: index for index, token in enumerate(tf_counter)}
+    sorted_tokens = sorted(
+        tf_counter.items(),
+        key=lambda item: (
+            -item[1],
+            0 if is_korean_token(item[0]) else 1,
+            token_order[item[0]],
+        ),
+    )
+    limited_counter: Counter[str] = Counter()
+    for token, tf in sorted_tokens[:max_tokens]:
+        limited_counter[token] = tf
+    return limited_counter
 
 
 def compute_doc_token_counters(title: str, content: str) -> dict[str, Counter[str]]:
