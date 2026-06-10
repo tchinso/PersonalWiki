@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import math
 import re
 import sqlite3
 import threading
 from collections import Counter, defaultdict, deque
+from datetime import datetime
 from functools import lru_cache
 
 ENGLISH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{2,}(?![A-Za-z0-9])")
@@ -170,69 +172,24 @@ KOREAN_STOPWORDS_LONGEST_FIRST = tuple(sorted(KOREAN_STOPWORDS, key=lambda word:
 _TAG_RECOMMEND_CACHE_LOCK = threading.Lock()
 _TAG_RECOMMEND_CACHE: dict[str, object] = {
     "signature": None,
-    "corpus": [],
-    "entries_by_id": {},
-    "doc_states": {},
-    "df_counter": Counter(),
     "total_docs": 0,
-    "content_cutoff": None,
+    "idf_by_token": {},
+    "df_by_token": {},
 }
+TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v1"
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
 TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
-TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 200
-TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 30
-TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK = 30
+TAG_RECOMMEND_MAX_TOKENS_PER_DOC = 512
+TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 250
+TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 50
+TAG_RECOMMEND_TOKEN_DB_MAX_QUERY_TERMS = 50
+TAG_RECOMMEND_TOKEN_DB_CANDIDATE_LIMIT = 500
+TAG_RECOMMEND_TOKEN_DB_MAX_DF_RATIO = 0.20
+TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK = 80
+TAG_RECOMMEND_DEBUG = os.environ.get("PERSONALWIKI_TAG_RECOMMEND_DEBUG") == "1"
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
-TAG_RECOMMEND_CUTOFF_START_DOCS = 100
-TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS = 6_000
-TAG_RECOMMEND_CUTOFF_STEP = 100
-TAG_RECOMMEND_CUTOFF_START_BUDGET = 120_000_000
-TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET = 60_000_000
-
-
-def _tag_recommend_budget_for_doc_count(doc_count: int) -> int:
-    if doc_count <= TAG_RECOMMEND_CUTOFF_START_DOCS:
-        return TAG_RECOMMEND_CUTOFF_START_BUDGET
-    if doc_count >= TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS:
-        return TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET
-
-    span = TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS - TAG_RECOMMEND_CUTOFF_START_DOCS
-    used = doc_count - TAG_RECOMMEND_CUTOFF_START_DOCS
-    budget_drop = TAG_RECOMMEND_CUTOFF_START_BUDGET - TAG_RECOMMEND_CUTOFF_FLOOR_BUDGET
-    return TAG_RECOMMEND_CUTOFF_START_BUDGET - ((budget_drop * used) // span)
-
-
-def _tag_recommend_cutoff_for_doc_count(doc_count: int) -> int:
-    return max(1, _tag_recommend_budget_for_doc_count(doc_count) // max(doc_count, 1))
-
-
-TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS: tuple[tuple[int, int], ...] = (
-    (1, _tag_recommend_cutoff_for_doc_count(100)),
-    *(
-        (_doc_count, _tag_recommend_cutoff_for_doc_count(_doc_count))
-        for _doc_count in range(
-            TAG_RECOMMEND_CUTOFF_START_DOCS,
-            TAG_RECOMMEND_CUTOFF_FULL_BUDGET_DOCS,
-            TAG_RECOMMEND_CUTOFF_STEP,
-        )
-    ),
-    (6_000, 10_000),
-    (8_000, 7_500),
-    (10_000, 6_000),
-    (15_000, 4_000),
-    (20_000, 3_000),
-    (25_000, 2_400),
-    (30_000, 2_000),
-    (40_000, 1_500),
-    (50_000, 1_200),
-    (60_000, 1_000),
-    (80_000, 750),
-    (100_000, 600),
-    (150_000, 400),
-    (200_000, 300),
-)
 
 KOREAN_SPELL_REPLACE_DB: tuple[tuple[str, str], ...] = (
     ("오래동안", "오랫동안"),
@@ -377,12 +334,9 @@ KOREAN_SPELL_SAMPLE_LIMIT = 8
 def invalidate_tag_recommendation_cache() -> None:
     with _TAG_RECOMMEND_CACHE_LOCK:
         _TAG_RECOMMEND_CACHE["signature"] = None
-        _TAG_RECOMMEND_CACHE["corpus"] = []
-        _TAG_RECOMMEND_CACHE["entries_by_id"] = {}
-        _TAG_RECOMMEND_CACHE["doc_states"] = {}
-        _TAG_RECOMMEND_CACHE["df_counter"] = Counter()
         _TAG_RECOMMEND_CACHE["total_docs"] = 0
-        _TAG_RECOMMEND_CACHE["content_cutoff"] = None
+        _TAG_RECOMMEND_CACHE["idf_by_token"] = {}
+        _TAG_RECOMMEND_CACHE["df_by_token"] = {}
 
 
 KOREAN_SPELL_REPLACEMENTS = dict(KOREAN_SPELL_REPLACE_DB)
@@ -632,8 +586,410 @@ def build_tfidf_vector(tf_counter: Counter[str], df_counter: Counter[str], total
         if tf <= 0:
             continue
         df = df_counter.get(token, 0)
-        idf_base = math.log((total_docs + 1) / (df + 1)) + 1
-        idf = idf_base ** TAG_RECOMMEND_IDF_EXPONENT
+        vec[token] = float(tf) * compute_tag_recommendation_idf(total_docs, df)
+    return vec
+
+
+def compute_tag_recommendation_idf(total_docs: int, df: int) -> float:
+    if total_docs <= 0:
+        return 0.0
+    idf_base = math.log((total_docs + 1) / (max(df, 0) + 1)) + 1
+    return idf_base ** TAG_RECOMMEND_IDF_EXPONENT
+
+
+def limit_tf_counter(tf_counter: Counter[str], max_tokens: int) -> Counter[str]:
+    if max_tokens <= 0 or len(tf_counter) <= max_tokens:
+        return tf_counter
+    return Counter(dict(tf_counter.most_common(max_tokens)))
+
+
+def compute_doc_token_counters(title: str, content: str) -> dict[str, Counter[str]]:
+    title_counter = Counter(tokenize_text(title))
+    content_counter = limit_tf_counter(
+        Counter(tokenize_text(content)),
+        TAG_RECOMMEND_MAX_TOKENS_PER_DOC,
+    )
+    return {
+        "title": title_counter,
+        "content": content_counter,
+    }
+
+
+def ensure_language_token_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS language_doc_tokens (
+            doc_id INTEGER NOT NULL,
+            token TEXT NOT NULL,
+            tf INTEGER NOT NULL,
+            field TEXT NOT NULL DEFAULT 'content',
+            PRIMARY KEY (doc_id, token, field)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token
+        ON language_doc_tokens(token)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_doc_id
+        ON language_doc_tokens(doc_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token_tf
+        ON language_doc_tokens(token, tf DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS language_token_stats (
+            token TEXT PRIMARY KEY,
+            df INTEGER NOT NULL,
+            idf REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS language_index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _get_language_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM language_index_meta WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return str(row["value"]) if row is not None else None
+
+
+def _set_language_meta(conn: sqlite3.Connection, key: str, value: object) -> None:
+    conn.execute(
+        """
+        INSERT INTO language_index_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def _get_stored_language_total_docs(conn: sqlite3.Connection) -> int | None:
+    value = _get_language_meta(conn, "total_docs")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _get_main_doc_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()
+    return int(row["c"]) if row is not None else 0
+
+
+def _set_language_total_docs_and_version(conn: sqlite3.Connection, total_docs: int) -> None:
+    _set_language_meta(conn, "total_docs", total_docs)
+    _set_language_meta(conn, "tokenizer_version", TAG_RECOMMEND_TOKENIZER_VERSION)
+
+
+def get_existing_doc_token_set(conn: sqlite3.Connection, doc_id: int) -> set[str]:
+    ensure_language_token_tables(conn)
+    rows = conn.execute(
+        """
+        SELECT DISTINCT token
+        FROM language_doc_tokens
+        WHERE doc_id = ?
+        """,
+        (doc_id,),
+    ).fetchall()
+    return {str(row["token"]) for row in rows}
+
+
+def _doc_token_rows(doc_id: int, counters: dict[str, Counter[str]]) -> list[tuple[int, str, int, str]]:
+    rows: list[tuple[int, str, int, str]] = []
+    for field in ("title", "content"):
+        for token, tf in counters.get(field, Counter()).items():
+            if tf > 0:
+                rows.append((doc_id, token, int(tf), field))
+    return rows
+
+
+def _doc_token_set(counters: dict[str, Counter[str]]) -> set[str]:
+    tokens: set[str] = set()
+    for counter in counters.values():
+        tokens.update(counter.keys())
+    return tokens
+
+
+def _chunked(values: list[object], size: int = SQLITE_IN_CLAUSE_CHUNK_SIZE):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _increment_language_token_dfs(conn: sqlite3.Connection, tokens: set[str]) -> None:
+    if not tokens:
+        return
+    conn.executemany(
+        """
+        INSERT INTO language_token_stats (token, df, idf)
+        VALUES (?, 1, 0.0)
+        ON CONFLICT(token) DO UPDATE SET df = df + 1
+        """,
+        [(token,) for token in sorted(tokens)],
+    )
+
+
+def _decrement_language_token_dfs(conn: sqlite3.Connection, tokens: set[str]) -> None:
+    if not tokens:
+        return
+    conn.executemany(
+        "UPDATE language_token_stats SET df = df - 1 WHERE token = ?",
+        [(token,) for token in sorted(tokens)],
+    )
+    conn.execute("DELETE FROM language_token_stats WHERE df <= 0")
+
+
+def _recompute_language_token_idfs(
+    conn: sqlite3.Connection,
+    total_docs: int,
+    tokens: set[str] | None = None,
+) -> None:
+    if tokens is None:
+        rows = conn.execute("SELECT token, df FROM language_token_stats").fetchall()
+    else:
+        token_list = sorted(tokens)
+        if not token_list:
+            return
+        rows = []
+        for chunk in _chunked(token_list):
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                conn.execute(
+                    f"SELECT token, df FROM language_token_stats WHERE token IN ({placeholders})",
+                    list(chunk),
+                ).fetchall()
+            )
+    updates = [
+        (compute_tag_recommendation_idf(total_docs, int(row["df"])), str(row["token"]))
+        for row in rows
+    ]
+    if updates:
+        conn.executemany(
+            "UPDATE language_token_stats SET idf = ? WHERE token = ?",
+            updates,
+        )
+
+
+def upsert_language_doc_tokens(
+    token_conn: sqlite3.Connection,
+    main_conn: sqlite3.Connection,
+    doc_id: int,
+    title: str,
+    content: str,
+) -> None:
+    ensure_language_token_tables(token_conn)
+    old_token_set = get_existing_doc_token_set(token_conn, doc_id)
+    counters = compute_doc_token_counters(title, content)
+    new_token_set = _doc_token_set(counters)
+    total_docs = _get_main_doc_count(main_conn)
+    stored_total_docs = _get_stored_language_total_docs(token_conn)
+
+    removed_tokens = old_token_set - new_token_set
+    added_tokens = new_token_set - old_token_set
+    _decrement_language_token_dfs(token_conn, removed_tokens)
+    _increment_language_token_dfs(token_conn, added_tokens)
+
+    token_conn.execute("DELETE FROM language_doc_tokens WHERE doc_id = ?", (doc_id,))
+    rows = _doc_token_rows(doc_id, counters)
+    if rows:
+        token_conn.executemany(
+            """
+            INSERT INTO language_doc_tokens (doc_id, token, tf, field)
+            VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    if stored_total_docs != total_docs:
+        _recompute_language_token_idfs(token_conn, total_docs)
+    else:
+        _recompute_language_token_idfs(token_conn, total_docs, removed_tokens | added_tokens)
+    _set_language_total_docs_and_version(token_conn, total_docs)
+    invalidate_tag_recommendation_cache()
+
+
+def delete_language_doc_tokens(
+    token_conn: sqlite3.Connection,
+    main_conn: sqlite3.Connection,
+    doc_id: int,
+) -> None:
+    ensure_language_token_tables(token_conn)
+    old_token_set = get_existing_doc_token_set(token_conn, doc_id)
+    stored_total_docs = _get_stored_language_total_docs(token_conn)
+    total_docs = _get_main_doc_count(main_conn)
+
+    _decrement_language_token_dfs(token_conn, old_token_set)
+    token_conn.execute("DELETE FROM language_doc_tokens WHERE doc_id = ?", (doc_id,))
+    if stored_total_docs != total_docs:
+        _recompute_language_token_idfs(token_conn, total_docs)
+    else:
+        _recompute_language_token_idfs(token_conn, total_docs, old_token_set)
+    _set_language_total_docs_and_version(token_conn, total_docs)
+    invalidate_tag_recommendation_cache()
+
+
+def rebuild_language_token_index(
+    token_conn: sqlite3.Connection,
+    main_conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+) -> tuple[int, int]:
+    ensure_language_token_tables(token_conn)
+    token_conn.execute("DELETE FROM language_doc_tokens")
+    token_conn.execute("DELETE FROM language_token_stats")
+
+    doc_rows = main_conn.execute("SELECT id, title FROM docs ORDER BY id").fetchall()
+    total_docs = len(doc_rows)
+    df_counter: Counter[str] = Counter()
+    pending_rows: list[tuple[int, str, int, str]] = []
+
+    def flush_pending_rows() -> None:
+        nonlocal pending_rows
+        if not pending_rows:
+            return
+        token_conn.executemany(
+            """
+            INSERT INTO language_doc_tokens (doc_id, token, tf, field)
+            VALUES (?, ?, ?, ?)
+            """,
+            pending_rows,
+        )
+        pending_rows = []
+
+    for chunk in _chunked(doc_rows):
+        doc_ids = [int(row["id"]) for row in chunk]
+        placeholders = ",".join("?" for _ in doc_ids)
+        content_by_id: dict[int, str] = {}
+        if doc_ids:
+            for fts_row in fts_conn.execute(
+                f"SELECT rowid AS doc_id, content FROM docs_fts WHERE rowid IN ({placeholders})",
+                doc_ids,
+            ):
+                content_by_id[int(fts_row["doc_id"])] = str(fts_row["content"] or "")
+
+        for row in chunk:
+            doc_id = int(row["id"])
+            counters = compute_doc_token_counters(
+                str(row["title"] or ""),
+                content_by_id.get(doc_id, ""),
+            )
+            token_set = _doc_token_set(counters)
+            df_counter.update(token_set)
+            pending_rows.extend(_doc_token_rows(doc_id, counters))
+            if len(pending_rows) >= 5000:
+                flush_pending_rows()
+    flush_pending_rows()
+
+    stats_rows = [
+        (token, int(df), compute_tag_recommendation_idf(total_docs, int(df)))
+        for token, df in sorted(df_counter.items())
+    ]
+    if stats_rows:
+        token_conn.executemany(
+            """
+            INSERT INTO language_token_stats (token, df, idf)
+            VALUES (?, ?, ?)
+            """,
+            stats_rows,
+        )
+    _set_language_total_docs_and_version(token_conn, total_docs)
+    _set_language_meta(token_conn, "last_rebuild_at", datetime.now().isoformat(timespec="seconds"))
+    invalidate_tag_recommendation_cache()
+    return total_docs, len(stats_rows)
+
+
+def language_token_index_needs_rebuild(
+    token_conn: sqlite3.Connection,
+    main_conn: sqlite3.Connection,
+) -> bool:
+    ensure_language_token_tables(token_conn)
+    total_docs = _get_main_doc_count(main_conn)
+    tokenizer_version = _get_language_meta(token_conn, "tokenizer_version")
+    stored_total_docs = _get_stored_language_total_docs(token_conn)
+    token_row = token_conn.execute("SELECT COUNT(*) AS c FROM language_doc_tokens").fetchone()
+    token_row_count = int(token_row["c"]) if token_row is not None else 0
+    if tokenizer_version != TAG_RECOMMEND_TOKENIZER_VERSION:
+        return True
+    if stored_total_docs != total_docs:
+        return True
+    if total_docs > 0 and token_row_count == 0:
+        return True
+    return False
+
+
+def ensure_language_token_index_current(
+    token_conn: sqlite3.Connection,
+    main_conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+) -> tuple[bool, int, int]:
+    if language_token_index_needs_rebuild(token_conn, main_conn):
+        total_docs, token_count = rebuild_language_token_index(token_conn, main_conn, fts_conn)
+        return True, total_docs, token_count
+    total_docs = _get_main_doc_count(main_conn)
+    row = token_conn.execute("SELECT COUNT(*) AS c FROM language_token_stats").fetchone()
+    token_count = int(row["c"]) if row is not None else 0
+    return False, total_docs, token_count
+
+
+def get_language_token_stats_for_tokens(
+    conn: sqlite3.Connection,
+    tokens: list[str],
+) -> tuple[dict[str, int], dict[str, float]]:
+    ensure_language_token_tables(conn)
+    unique_tokens = sorted(set(tokens))
+    if not unique_tokens:
+        return {}, {}
+
+    df_by_token: dict[str, int] = {}
+    idf_by_token: dict[str, float] = {}
+    for chunk in _chunked(unique_tokens):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT token, df, idf
+            FROM language_token_stats
+            WHERE token IN ({placeholders})
+            """,
+            list(chunk),
+        ).fetchall()
+        for row in rows:
+            token = str(row["token"])
+            df_by_token[token] = int(row["df"])
+            idf_by_token[token] = float(row["idf"])
+    return df_by_token, idf_by_token
+
+
+def build_tfidf_vector_from_idf(
+    tf_counter: Counter[str],
+    idf_by_token: dict[str, float],
+) -> dict[str, float]:
+    vec: dict[str, float] = {}
+    for token, tf in tf_counter.items():
+        if tf <= 0:
+            continue
+        idf = idf_by_token.get(token)
+        if idf is None:
+            continue
         vec[token] = float(tf) * idf
     return vec
 
@@ -671,23 +1027,35 @@ def tag_recommend_rank_weight(rank: int) -> float:
     return float(base) ** TAG_RECOMMEND_RANK_WEIGHT_EXPONENT
 
 
-def get_tag_recommend_corpus_content_cutoff(doc_count: int) -> int | None:
-    cutoff: int | None = None
-    for min_docs, char_limit in TAG_RECOMMEND_CORPUS_CONTENT_CUTOFFS:
-        if doc_count < min_docs:
-            break
-        cutoff = char_limit
-    return cutoff
-
-
 def escape_fts5_phrase_token(token: str) -> str:
     return '"' + token.replace('"', '""') + '"'
+
+
+def select_tag_recommendation_fts_query_tokens(
+    query_tokens: list[str],
+    df_by_token: dict[str, int] | Counter[str],
+    total_docs: int,
+) -> list[str]:
+    token_counts = Counter(query_tokens)
+    first_positions: dict[str, int] = {}
+    for index, token in enumerate(query_tokens):
+        first_positions.setdefault(token, index)
+
+    def token_idf(token: str) -> float:
+        df = df_by_token.get(token, 0)
+        return math.log((total_docs + 1) / (df + 1)) + 1
+
+    ranked_tokens = sorted(
+        first_positions.keys(),
+        key=lambda token: (-token_idf(token), -token_counts[token], first_positions[token]),
+    )
+    return ranked_tokens[:TAG_RECOMMEND_FTS_MAX_QUERY_TERMS]
 
 
 def find_tag_recommendation_candidate_doc_ids(
     fts_conn: sqlite3.Connection,
     query_tokens: list[str],
-    df_counter: Counter[str],
+    df_by_token: dict[str, int] | Counter[str],
     total_docs: int,
     *,
     limit: int = TAG_RECOMMEND_FTS_CANDIDATE_LIMIT,
@@ -695,20 +1063,11 @@ def find_tag_recommendation_candidate_doc_ids(
     if not query_tokens or total_docs <= 0 or limit <= 0:
         return set()
 
-    token_counts = Counter(query_tokens)
-    first_positions: dict[str, int] = {}
-    for index, token in enumerate(query_tokens):
-        first_positions.setdefault(token, index)
-
-    def token_idf(token: str) -> float:
-        df = df_counter.get(token, 0)
-        return math.log((total_docs + 1) / (df + 1)) + 1
-
-    ranked_tokens = sorted(
-        first_positions.keys(),
-        key=lambda token: (-token_idf(token), -token_counts[token], first_positions[token]),
+    selected_tokens = select_tag_recommendation_fts_query_tokens(
+        query_tokens,
+        df_by_token,
+        total_docs,
     )
-    selected_tokens = ranked_tokens[:TAG_RECOMMEND_FTS_MAX_QUERY_TERMS]
     if not selected_tokens:
         return set()
 
@@ -728,6 +1087,162 @@ def find_tag_recommendation_candidate_doc_ids(
         return set()
 
     return {int(row["doc_id"]) for row in rows}
+
+
+def select_tag_recommendation_language_query_tokens(
+    query_tokens: list[str],
+    df_by_token: dict[str, int],
+    idf_by_token: dict[str, float],
+    total_docs: int,
+) -> list[str]:
+    if total_docs <= 0:
+        return []
+    token_counts = Counter(query_tokens)
+    first_positions: dict[str, int] = {}
+    for index, token in enumerate(query_tokens):
+        first_positions.setdefault(token, index)
+
+    usable_tokens = [
+        token
+        for token in first_positions.keys()
+        if df_by_token.get(token, 0) > 0
+        and (df_by_token[token] / max(total_docs, 1)) <= TAG_RECOMMEND_TOKEN_DB_MAX_DF_RATIO
+    ]
+    usable_tokens.sort(
+        key=lambda token: (
+            -idf_by_token.get(token, 0.0),
+            -token_counts[token],
+            first_positions[token],
+        )
+    )
+    return usable_tokens[:TAG_RECOMMEND_TOKEN_DB_MAX_QUERY_TERMS]
+
+
+def find_tag_recommendation_language_candidate_doc_ids(
+    conn: sqlite3.Connection,
+    query_tokens: list[str],
+    total_docs: int,
+    *,
+    limit: int = TAG_RECOMMEND_TOKEN_DB_CANDIDATE_LIMIT,
+) -> set[int]:
+    if not query_tokens or total_docs <= 0 or limit <= 0:
+        return set()
+
+    df_by_token, idf_by_token = get_language_token_stats_for_tokens(conn, query_tokens)
+    selected_tokens = select_tag_recommendation_language_query_tokens(
+        query_tokens,
+        df_by_token,
+        idf_by_token,
+        total_docs,
+    )
+    if not selected_tokens:
+        return set()
+
+    placeholders = ",".join("?" for _ in selected_tokens)
+    rows = conn.execute(
+        f"""
+        SELECT
+            l.doc_id,
+            SUM(l.tf * s.idf) AS token_score,
+            COUNT(DISTINCT l.token) AS overlap_count
+        FROM language_doc_tokens l
+        JOIN language_token_stats s ON s.token = l.token
+        WHERE l.token IN ({placeholders})
+        GROUP BY l.doc_id
+        ORDER BY token_score DESC, overlap_count DESC
+        LIMIT ?
+        """,
+        [*selected_tokens, limit],
+    ).fetchall()
+    return {int(row["doc_id"]) for row in rows}
+
+
+def build_doc_vectors_from_language_tokens(
+    conn: sqlite3.Connection,
+    doc_ids: list[int],
+    idf_by_token: dict[str, float],
+) -> dict[int, dict[str, float]]:
+    unique_doc_ids = sorted(set(int(doc_id) for doc_id in doc_ids))
+    if not unique_doc_ids:
+        return {}
+
+    vectors: dict[int, dict[str, float]] = defaultdict(dict)
+    for chunk in _chunked(unique_doc_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        if idf_by_token:
+            rows = conn.execute(
+                f"""
+                SELECT doc_id, token, SUM(tf) AS tf
+                FROM language_doc_tokens
+                WHERE doc_id IN ({placeholders})
+                GROUP BY doc_id, token
+                """,
+                list(chunk),
+            ).fetchall()
+            for row in rows:
+                token = str(row["token"])
+                idf = idf_by_token.get(token)
+                if idf is None:
+                    continue
+                vectors[int(row["doc_id"])][token] = float(row["tf"]) * idf
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT l.doc_id, l.token, SUM(l.tf * s.idf) AS value
+                FROM language_doc_tokens l
+                JOIN language_token_stats s ON s.token = l.token
+                WHERE l.doc_id IN ({placeholders})
+                GROUP BY l.doc_id, l.token
+                """,
+                list(chunk),
+            ).fetchall()
+            for row in rows:
+                vectors[int(row["doc_id"])][str(row["token"])] = float(row["value"] or 0.0)
+    return {doc_id: vec for doc_id, vec in vectors.items() if vec}
+
+
+def _fetch_recommendation_doc_rows(
+    conn: sqlite3.Connection,
+    *,
+    doc_ids: set[int] | None,
+    current_slug: str | None,
+) -> list[sqlite3.Row]:
+    params: list[object] = []
+    where_parts: list[str] = []
+    if current_slug:
+        where_parts.append("slug != ?")
+        params.append(current_slug)
+
+    if doc_ids is None:
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return conn.execute(
+            f"SELECT id, slug FROM docs {where_sql} ORDER BY id",
+            params,
+        ).fetchall()
+
+    if not doc_ids:
+        return []
+
+    rows: list[sqlite3.Row] = []
+    for chunk in _chunked(sorted(doc_ids)):
+        chunk_where = list(where_parts)
+        placeholders = ",".join("?" for _ in chunk)
+        chunk_where.append(f"id IN ({placeholders})")
+        where_sql = " AND ".join(chunk_where)
+        rows.extend(
+            conn.execute(
+                f"SELECT id, slug FROM docs WHERE {where_sql} ORDER BY id",
+                [*params, *chunk],
+            ).fetchall()
+        )
+    return rows
+
+
+def _log_tag_recommendation_debug(**values: object) -> None:
+    if not TAG_RECOMMEND_DEBUG:
+        return
+    details = " ".join(f"{key}={value}" for key, value in values.items())
+    print(f"[TAG_RECOMMEND] {details}")
 
 
 def build_tag_recommendation_signature(
@@ -758,57 +1273,13 @@ def build_tag_recommendation_corpus(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
 ) -> list[dict[str, object]]:
-    signature = build_tag_recommendation_signature(conn, fts_conn)
-    with _TAG_RECOMMEND_CACHE_LOCK:
-        cached_signature = _TAG_RECOMMEND_CACHE.get("signature")
-        cached_corpus = _TAG_RECOMMEND_CACHE.get("corpus")
-        if cached_signature == signature and isinstance(cached_corpus, list):
-            return cached_corpus
-
     rows = conn.execute("SELECT id, title, slug, updated_at FROM docs ORDER BY id").fetchall()
     if not rows:
-        with _TAG_RECOMMEND_CACHE_LOCK:
-            _TAG_RECOMMEND_CACHE["signature"] = signature
-            _TAG_RECOMMEND_CACHE["corpus"] = []
-            _TAG_RECOMMEND_CACHE["entries_by_id"] = {}
-            _TAG_RECOMMEND_CACHE["doc_states"] = {}
-            _TAG_RECOMMEND_CACHE["df_counter"] = Counter()
-            _TAG_RECOMMEND_CACHE["total_docs"] = 0
-            _TAG_RECOMMEND_CACHE["content_cutoff"] = None
         return []
 
     doc_meta_by_id = {int(row["id"]): row for row in rows}
     doc_ids = list(doc_meta_by_id.keys())
     tag_map = _build_doc_tag_map(conn, doc_ids)
-    content_cutoff = get_tag_recommend_corpus_content_cutoff(len(rows))
-    doc_states: dict[int, tuple[str, str, str, tuple[str, ...]]] = {
-        doc_id: (
-            str(row["title"]),
-            str(row["slug"]),
-            str(row["updated_at"]),
-            tuple(tag_map.get(doc_id, [])),
-        )
-        for doc_id, row in doc_meta_by_id.items()
-    }
-
-    with _TAG_RECOMMEND_CACHE_LOCK:
-        cached_entries_raw = _TAG_RECOMMEND_CACHE.get("entries_by_id")
-        cached_states_raw = _TAG_RECOMMEND_CACHE.get("doc_states")
-        cached_cutoff = _TAG_RECOMMEND_CACHE.get("content_cutoff")
-    cached_entries = cached_entries_raw if isinstance(cached_entries_raw, dict) else {}
-    cached_states = cached_states_raw if isinstance(cached_states_raw, dict) else {}
-    can_reuse_cached_entries = bool(cached_entries) and cached_cutoff == content_cutoff
-
-    entries_by_id: dict[int, dict[str, object]] = {}
-    changed_doc_ids: list[int] = []
-    if can_reuse_cached_entries:
-        for doc_id in doc_ids:
-            if cached_states.get(doc_id) == doc_states[doc_id] and doc_id in cached_entries:
-                entries_by_id[doc_id] = dict(cached_entries[doc_id])
-            else:
-                changed_doc_ids.append(doc_id)
-    else:
-        changed_doc_ids = doc_ids
 
     def make_corpus_entry(doc_id: int, content: str) -> dict[str, object] | None:
         row = doc_meta_by_id.get(doc_id)
@@ -828,24 +1299,18 @@ def build_tag_recommendation_corpus(
         }
 
     fts_content_by_id: dict[int, str] = {}
-    for chunk_start in range(0, len(changed_doc_ids), 400):
-        chunk = changed_doc_ids[chunk_start : chunk_start + 400]
+    for chunk_start in range(0, len(doc_ids), 400):
+        chunk = doc_ids[chunk_start : chunk_start + 400]
         if not chunk:
             continue
         placeholders = ",".join("?" for _ in chunk)
-        if content_cutoff is None:
-            rows_sql = f"SELECT rowid AS doc_id, content FROM docs_fts WHERE rowid IN ({placeholders})"
-            params: list[object] = list(chunk)
-        else:
-            rows_sql = (
-                f"SELECT rowid AS doc_id, substr(content, 1, ?) AS content "
-                f"FROM docs_fts WHERE rowid IN ({placeholders})"
-            )
-            params = [content_cutoff, *chunk]
+        rows_sql = f"SELECT rowid AS doc_id, content FROM docs_fts WHERE rowid IN ({placeholders})"
+        params: list[object] = list(chunk)
         for fts_row in fts_conn.execute(rows_sql, params):
             fts_content_by_id[int(fts_row["doc_id"])] = str(fts_row["content"] or "")
 
-    for doc_id in changed_doc_ids:
+    entries_by_id: dict[int, dict[str, object]] = {}
+    for doc_id in doc_ids:
         entry = make_corpus_entry(doc_id, fts_content_by_id.get(doc_id, ""))
         if entry is not None:
             entries_by_id[doc_id] = entry
@@ -862,20 +1327,13 @@ def build_tag_recommendation_corpus(
         doc["tfidf_vector"] = doc_vec
         doc["tfidf_norm"] = vector_norm(doc_vec)
 
-    with _TAG_RECOMMEND_CACHE_LOCK:
-        _TAG_RECOMMEND_CACHE["signature"] = signature
-        _TAG_RECOMMEND_CACHE["corpus"] = corpus
-        _TAG_RECOMMEND_CACHE["entries_by_id"] = entries_by_id
-        _TAG_RECOMMEND_CACHE["doc_states"] = doc_states
-        _TAG_RECOMMEND_CACHE["df_counter"] = df_counter
-        _TAG_RECOMMEND_CACHE["total_docs"] = total_docs
-        _TAG_RECOMMEND_CACHE["content_cutoff"] = content_cutoff
     return corpus
 
 
 def recommend_tags(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection | None = None,
     *,
     title: str,
     content: str,
@@ -887,43 +1345,92 @@ def recommend_tags(
     if not query_tokens:
         return []
 
-    base_corpus = build_tag_recommendation_corpus(conn, fts_conn)
-    full_corpus = [
-        doc
-        for doc in base_corpus
-        if not current_slug or str(doc["slug"]) != current_slug
-    ]
-    if not full_corpus:
+    token_conn = token_conn or conn
+    ensure_language_token_tables(token_conn)
+    total_docs = _get_main_doc_count(conn)
+    if total_docs <= 0:
         return []
 
-    with _TAG_RECOMMEND_CACHE_LOCK:
-        cached_df_counter = _TAG_RECOMMEND_CACHE.get("df_counter")
-        cached_total_docs = _TAG_RECOMMEND_CACHE.get("total_docs")
-    df_counter = cached_df_counter if isinstance(cached_df_counter, Counter) else Counter()
-    total_docs = cached_total_docs if isinstance(cached_total_docs, int) else len(base_corpus)
+    df_by_token, idf_by_token = get_language_token_stats_for_tokens(token_conn, query_tokens)
     candidate_query_tokens = [
         token
         for token in query_tokens
-        if df_counter.get(token, 0) > 0
+        if df_by_token.get(token, 0) > 0
     ]
-    candidate_doc_ids = find_tag_recommendation_candidate_doc_ids(
-        fts_conn,
+    selected_fts_tokens = select_tag_recommendation_fts_query_tokens(
         candidate_query_tokens,
-        df_counter,
+        df_by_token,
         total_docs,
     )
-    corpus = full_corpus
-    if len(candidate_doc_ids) >= TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK:
-        candidate_corpus = [
-            doc
-            for doc in full_corpus
-            if isinstance(doc.get("doc_id"), int) and int(doc["doc_id"]) in candidate_doc_ids
-        ]
-        if candidate_corpus:
-            corpus = candidate_corpus
+    fts_candidate_doc_ids = find_tag_recommendation_candidate_doc_ids(
+        fts_conn,
+        candidate_query_tokens,
+        df_by_token,
+        total_docs,
+    )
+    selected_token_db_tokens = select_tag_recommendation_language_query_tokens(
+        candidate_query_tokens,
+        df_by_token,
+        idf_by_token,
+        total_docs,
+    )
+    token_candidate_doc_ids = find_tag_recommendation_language_candidate_doc_ids(
+        token_conn,
+        candidate_query_tokens,
+        total_docs,
+    )
+    candidate_doc_ids = fts_candidate_doc_ids | token_candidate_doc_ids
+    fallback_used = len(candidate_doc_ids) < TAG_RECOMMEND_MIN_CANDIDATE_FALLBACK
 
-    query_vec = build_tfidf_vector(Counter(query_tokens), df_counter, total_docs)
+    doc_rows = _fetch_recommendation_doc_rows(
+        conn,
+        doc_ids=None if fallback_used else candidate_doc_ids,
+        current_slug=current_slug,
+    )
+    if not doc_rows:
+        _log_tag_recommendation_debug(
+            query_tokens=len(query_tokens),
+            selected_fts_terms=len(selected_fts_tokens),
+            selected_token_db_terms=len(selected_token_db_tokens),
+            fts_candidates=len(fts_candidate_doc_ids),
+            token_db_candidates=len(token_candidate_doc_ids),
+            merged_candidates=len(candidate_doc_ids),
+            fallback_used=fallback_used,
+            scored_docs=0,
+            final_tags=0,
+        )
+        return []
+
+    doc_ids = [int(row["id"]) for row in doc_rows]
+    tag_map = _build_doc_tag_map(conn, doc_ids)
+    doc_vectors = build_doc_vectors_from_language_tokens(token_conn, doc_ids, {})
+    if not doc_vectors:
+        _log_tag_recommendation_debug(
+            query_tokens=len(query_tokens),
+            selected_fts_terms=len(selected_fts_tokens),
+            selected_token_db_terms=len(selected_token_db_tokens),
+            fts_candidates=len(fts_candidate_doc_ids),
+            token_db_candidates=len(token_candidate_doc_ids),
+            merged_candidates=len(candidate_doc_ids),
+            fallback_used=fallback_used,
+            scored_docs=0,
+            final_tags=0,
+        )
+        return []
+
+    query_vec = build_tfidf_vector_from_idf(Counter(query_tokens), idf_by_token)
     if not query_vec:
+        _log_tag_recommendation_debug(
+            query_tokens=len(query_tokens),
+            selected_fts_terms=len(selected_fts_tokens),
+            selected_token_db_terms=len(selected_token_db_tokens),
+            fts_candidates=len(fts_candidate_doc_ids),
+            token_db_candidates=len(token_candidate_doc_ids),
+            merged_candidates=len(candidate_doc_ids),
+            fallback_used=fallback_used,
+            scored_docs=0,
+            final_tags=0,
+        )
         return []
     query_norm = vector_norm(query_vec)
     if query_norm == 0:
@@ -931,25 +1438,35 @@ def recommend_tags(
     query_token_set = set(query_vec.keys())
 
     scored_docs: list[tuple[float, list[str]]] = []
-    for doc in corpus:
-        tags = list(doc["tags"])
+    for doc_id in doc_ids:
+        tags = tag_map.get(doc_id, [])
         if not tags:
             continue
-        doc_vec = doc.get("tfidf_vector")
-        if not isinstance(doc_vec, dict):
+        doc_vec = doc_vectors.get(doc_id)
+        if not doc_vec:
             continue
         if not query_token_set.intersection(doc_vec.keys()):
             continue
-        doc_norm = doc.get("tfidf_norm")
         similarity = cosine_similarity(
             query_vec,
             doc_vec,
             norm_a=query_norm,
-            norm_b=doc_norm if isinstance(doc_norm, float) else None,
+            norm_b=vector_norm(doc_vec),
         )
         if similarity > 0:
             scored_docs.append((similarity, tags))
     if not scored_docs:
+        _log_tag_recommendation_debug(
+            query_tokens=len(query_tokens),
+            selected_fts_terms=len(selected_fts_tokens),
+            selected_token_db_terms=len(selected_token_db_tokens),
+            fts_candidates=len(fts_candidate_doc_ids),
+            token_db_candidates=len(token_candidate_doc_ids),
+            merged_candidates=len(candidate_doc_ids),
+            fallback_used=fallback_used,
+            scored_docs=0,
+            final_tags=0,
+        )
         return []
 
     scored_docs.sort(key=lambda item: item[0], reverse=True)
@@ -977,4 +1494,16 @@ def recommend_tags(
         tag_counts.keys(),
         key=lambda key: (-tag_scores[key], -tag_counts[key], display_names[key].casefold()),
     )
-    return [display_names[key] for key in ordered[:limit]]
+    recommendations = [display_names[key] for key in ordered[:limit]]
+    _log_tag_recommendation_debug(
+        query_tokens=len(query_tokens),
+        selected_fts_terms=len(selected_fts_tokens),
+        selected_token_db_terms=len(selected_token_db_tokens),
+        fts_candidates=len(fts_candidate_doc_ids),
+        token_db_candidates=len(token_candidate_doc_ids),
+        merged_candidates=len(candidate_doc_ids),
+        fallback_used=fallback_used,
+        scored_docs=len(scored_docs),
+        final_tags=len(recommendations),
+    )
+    return recommendations

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from markdown_engine import extract_reference_targets
+from language_tools import ensure_language_token_tables, rebuild_language_token_index
 
 
 def runtime_data_dir() -> Path:
@@ -25,6 +26,7 @@ DOC_DIR = DATA_DIR / "doc"
 JSON_DIR = DOC_DIR / "json"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
+TOKEN_DB_PATH = DATA_DIR / "wiki_token.db"
 DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 _DATA_LOCK_FILE = None
 
@@ -445,7 +447,7 @@ def restore_sqlite_backups(moved: list[tuple[Path, Path]]) -> None:
             backup.replace(original)
 
 
-def replace_databases_from_temp(temp_main: Path, temp_fts: Path) -> Path:
+def replace_databases_from_temp(temp_main: Path, temp_fts: Path, temp_token: Path) -> Path:
     backup_dir = DATA_DIR / "db_backups" / time.strftime("%Y%m%d-%H%M%S")
     backup_dir.mkdir(parents=True, exist_ok=True)
     moved: list[tuple[Path, Path]] = []
@@ -454,14 +456,18 @@ def replace_databases_from_temp(temp_main: Path, temp_fts: Path) -> Path:
     try:
         moved.extend(move_existing_sqlite_family(DB_PATH, backup_dir))
         moved.extend(move_existing_sqlite_family(FTS_DB_PATH, backup_dir))
+        moved.extend(move_existing_sqlite_family(TOKEN_DB_PATH, backup_dir))
 
         temp_main.replace(DB_PATH)
         replaced.append(DB_PATH)
         temp_fts.replace(FTS_DB_PATH)
         replaced.append(FTS_DB_PATH)
+        temp_token.replace(TOKEN_DB_PATH)
+        replaced.append(TOKEN_DB_PATH)
 
         remove_sqlite_family(temp_main)
         remove_sqlite_family(temp_fts)
+        remove_sqlite_family(temp_token)
         return backup_dir
     except Exception:
         for path in replaced:
@@ -471,13 +477,19 @@ def replace_databases_from_temp(temp_main: Path, temp_fts: Path) -> Path:
         raise
 
 
-def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path) -> tuple[int, int]:
+def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: Path) -> tuple[int, int, int]:
     imported = 0
     skipped = 0
+    token_terms = 0
 
-    with closing(connect_db(main_db_path)) as main_conn, closing(connect_db(fts_db_path)) as fts_conn:
+    with (
+        closing(connect_db(main_db_path)) as main_conn,
+        closing(connect_db(fts_db_path)) as fts_conn,
+        closing(connect_db(token_db_path)) as token_conn,
+    ):
         init_main_db(main_conn)
         init_fts_db(fts_conn)
+        ensure_language_token_tables(token_conn)
 
         for md_file in sorted(DOC_DIR.glob("*.md")):
             slug = md_file.stem
@@ -536,29 +548,34 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path) -> tuple[int, in
                 skipped += 1
                 print(f"[WARN] skipped {md_file.name}: {error}")
 
+        _token_docs, token_terms = rebuild_language_token_index(token_conn, main_conn, fts_conn)
         main_conn.commit()
         fts_conn.commit()
-    return imported, skipped
+        token_conn.commit()
+    return imported, skipped, token_terms
 
 
-def recreate_databases() -> tuple[int, int]:
+def recreate_databases() -> tuple[int, int, int]:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
 
     temp_main = DATA_DIR / "wiki.rebuild.db"
     temp_fts = DATA_DIR / "wiki_fts.rebuild.db"
+    temp_token = DATA_DIR / "wiki_token.rebuild.db"
     remove_sqlite_family(temp_main)
     remove_sqlite_family(temp_fts)
+    remove_sqlite_family(temp_token)
 
     try:
-        imported, skipped = rebuild_from_doc_dir(temp_main, temp_fts)
+        imported, skipped, token_terms = rebuild_from_doc_dir(temp_main, temp_fts, temp_token)
     except Exception:
         remove_sqlite_family(temp_main)
         remove_sqlite_family(temp_fts)
+        remove_sqlite_family(temp_token)
         raise
-    backup_dir = replace_databases_from_temp(temp_main, temp_fts)
+    backup_dir = replace_databases_from_temp(temp_main, temp_fts, temp_token)
     print(f"[OK] previous DB backup: {backup_dir}")
-    return imported, skipped
+    return imported, skipped, token_terms
 
 
 def main() -> int:
@@ -567,11 +584,12 @@ def main() -> int:
     print(f"Doc directory: {DOC_DIR}")
     print(f"Main DB: {DB_PATH}")
     print(f"FTS DB: {FTS_DB_PATH}")
+    print(f"Token DB: {TOKEN_DB_PATH}")
 
     try:
         acquire_data_lock()
         try:
-            imported, skipped = recreate_databases()
+            imported, skipped, token_terms = recreate_databases()
         finally:
             release_data_lock()
     except Exception as error:
@@ -579,6 +597,7 @@ def main() -> int:
         return 1
 
     print(f"[OK] recreated databases from /doc: imported={imported}, skipped={skipped}")
+    print(f"[OK] recreated token DB: terms={token_terms}")
     print("[OK] sidecar JSON now includes normalized backlink reference cache.")
     return 0
 

@@ -32,9 +32,13 @@ from language_tools import (
     TAG_RECOMMEND_LIMIT,
     apply_korean_spell_autofix,
     collect_korean_spell_issues,
+    delete_language_doc_tokens,
+    ensure_language_token_index_current,
+    ensure_language_token_tables,
     invalidate_tag_recommendation_cache,
     korean_spell_warning_message,
     recommend_tags,
+    upsert_language_doc_tokens,
 )
 
 
@@ -59,6 +63,7 @@ IMG_DIR = DATA_DIR / "img"
 FILE_DIR = DATA_DIR / "file"
 DB_PATH = DATA_DIR / "wiki.db"
 FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
+TOKEN_DB_PATH = DATA_DIR / "wiki_token.db"
 DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 TEMPLATE_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
@@ -179,6 +184,13 @@ def connect_fts_db() -> sqlite3.Connection:
     return conn
 
 
+def connect_token_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(TOKEN_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    configure_sqlite_connection(conn, foreign_keys=False)
+    return conn
+
+
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = connect_db()
@@ -191,6 +203,12 @@ def get_fts_db() -> sqlite3.Connection:
     return g.fts_db
 
 
+def get_token_db() -> sqlite3.Connection:
+    if "token_db" not in g:
+        g.token_db = connect_token_db()
+    return g.token_db
+
+
 @app.teardown_appcontext
 def close_db(_error: BaseException | None) -> None:
     conn = g.pop("db", None)
@@ -199,6 +217,9 @@ def close_db(_error: BaseException | None) -> None:
     fts_conn = g.pop("fts_db", None)
     if fts_conn is not None:
         fts_conn.close()
+    token_conn = g.pop("token_db", None)
+    if token_conn is not None:
+        token_conn.close()
 
 
 def init_storage() -> None:
@@ -293,6 +314,12 @@ def init_fts_db() -> None:
             USING fts5(title, content)
             """
         )
+        conn.commit()
+
+
+def init_token_db() -> None:
+    with closing(connect_token_db()) as conn:
+        ensure_language_token_tables(conn)
         conn.commit()
 
 
@@ -1036,6 +1063,7 @@ def is_severe_divergence(*, md_count: int, db_count: int, total_changes: int) ->
 def sync_new_doc(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
     *,
     slug: str,
     md_file: Path,
@@ -1081,6 +1109,7 @@ def sync_new_doc(
     set_doc_tags(conn, doc_id, tags)
     set_doc_references(conn, doc_id, references)
     update_fts(fts_conn, doc_id, title, content)
+    upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
     write_sidecar(
         slug=slug,
         title=title,
@@ -1095,6 +1124,7 @@ def sync_new_doc(
 def sync_modified_doc(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
     *,
     row: sqlite3.Row,
     md_file: Path,
@@ -1131,6 +1161,7 @@ def sync_modified_doc(
     tags = list_doc_tags(conn, doc_id)
     set_doc_references(conn, doc_id, references)
     update_fts(fts_conn, doc_id, current_title, content)
+    upsert_language_doc_tokens(token_conn, conn, doc_id, current_title, content)
     write_sidecar(
         slug=slug,
         title=current_title,
@@ -1142,13 +1173,24 @@ def sync_modified_doc(
     )
 
 
-def sync_deleted_doc(conn: sqlite3.Connection, fts_conn: sqlite3.Connection, *, row: sqlite3.Row) -> None:
+def sync_deleted_doc(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+) -> None:
     doc_id = int(row["id"])
     fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
     conn.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
+    delete_language_doc_tokens(token_conn, conn, doc_id)
 
 
-def repair_fts_mismatch(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> tuple[int, int]:
+def repair_fts_mismatch(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+) -> tuple[int, int]:
     doc_rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
     fts_rows = fts_conn.execute("SELECT rowid FROM docs_fts").fetchall()
 
@@ -1163,6 +1205,7 @@ def repair_fts_mismatch(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) 
         row = docs_by_id[doc_id]
         content = read_document_if_exists(str(row["slug"])) or ""
         update_fts(fts_conn, doc_id, str(row["title"]), content)
+        upsert_language_doc_tokens(token_conn, conn, doc_id, str(row["title"]), content)
 
     for doc_id in orphan_ids:
         fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
@@ -1171,7 +1214,7 @@ def repair_fts_mismatch(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) 
 
 
 def sync_documents_incremental() -> dict[str, int]:
-    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn:
+    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn, closing(connect_token_db()) as token_conn:
         md_snapshot = build_markdown_snapshot()
         db_snapshot = build_db_snapshot(conn)
         new_slugs, deleted_slugs, modified_slugs = detect_incremental_changes(md_snapshot, db_snapshot)
@@ -1192,29 +1235,32 @@ def sync_documents_incremental() -> dict[str, int]:
         for slug in new_slugs:
             md_file = md_snapshot[slug]["path"]
             mtime = float(md_snapshot[slug]["mtime"])
-            sync_new_doc(conn, fts_conn, slug=slug, md_file=md_file, mtime=mtime)
+            sync_new_doc(conn, fts_conn, token_conn, slug=slug, md_file=md_file, mtime=mtime)
 
         for slug in modified_slugs:
             md_file = md_snapshot[slug]["path"]
             mtime = float(md_snapshot[slug]["mtime"])
             row = db_snapshot[slug]
-            sync_modified_doc(conn, fts_conn, row=row, md_file=md_file, mtime=mtime)
+            sync_modified_doc(conn, fts_conn, token_conn, row=row, md_file=md_file, mtime=mtime)
 
         for slug in deleted_slugs:
-            sync_deleted_doc(conn, fts_conn, row=db_snapshot[slug])
+            sync_deleted_doc(conn, fts_conn, token_conn, row=db_snapshot[slug])
 
-        fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn)
+        fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn, token_conn)
         sidecar_repaired = repair_sidecar_mismatches(conn)
+        token_rebuilt, token_docs, token_terms = ensure_language_token_index_current(token_conn, conn, fts_conn)
 
         conn.commit()
         fts_conn.commit()
-        if total_changes > 0 or fts_missing > 0 or fts_orphan > 0:
+        token_conn.commit()
+        if total_changes > 0 or fts_missing > 0 or fts_orphan > 0 or token_rebuilt:
             invalidate_tag_recommendation_cache()
 
         print(
             "[SYNC] startup incremental sync "
             f"new={len(new_slugs)} deleted={len(deleted_slugs)} modified={len(modified_slugs)} "
-            f"fts_missing={fts_missing} fts_orphan={fts_orphan} sidecar_repaired={sidecar_repaired}"
+            f"fts_missing={fts_missing} fts_orphan={fts_orphan} sidecar_repaired={sidecar_repaired} "
+            f"token_rebuilt={token_rebuilt} token_docs={token_docs} token_terms={token_terms}"
         )
         return {
             "new": len(new_slugs),
@@ -1223,6 +1269,9 @@ def sync_documents_incremental() -> dict[str, int]:
             "fts_missing": fts_missing,
             "fts_orphan": fts_orphan,
             "sidecar_repaired": sidecar_repaired,
+            "token_rebuilt": int(token_rebuilt),
+            "token_docs": token_docs,
+            "token_terms": token_terms,
         }
 
 
@@ -1294,7 +1343,7 @@ def sync_documents_on_startup() -> None:
 
 
 def ensure_default_home() -> None:
-    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn:
+    with closing(connect_db()) as conn, closing(connect_fts_db()) as fts_conn, closing(connect_token_db()) as token_conn:
         count = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()["c"]
         if count > 0:
             return
@@ -1342,6 +1391,7 @@ def ensure_default_home() -> None:
         set_doc_tags(conn, doc_id, tags)
         set_doc_references(conn, doc_id, references)
         update_fts(fts_conn, doc_id, title, content)
+        upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
         write_sidecar(
             slug=slug,
             title=title,
@@ -1353,6 +1403,7 @@ def ensure_default_home() -> None:
         )
         conn.commit()
         fts_conn.commit()
+        token_conn.commit()
         invalidate_tag_recommendation_cache()
 
 
@@ -1423,6 +1474,7 @@ def view_doc(slug: str):
 def new_doc():
     conn = get_db()
     fts_conn = get_fts_db()
+    token_conn = get_token_db()
 
     if request.method == "POST":
         title = request.form.get("title", "").strip()
@@ -1437,6 +1489,7 @@ def new_doc():
             return recommend_tags(
                 conn,
                 fts_conn,
+                token_conn,
                 title=title,
                 content=content,
                 exclude_tags=tags,
@@ -1532,6 +1585,7 @@ def new_doc():
             set_doc_tags(conn, doc_id, tags)
             set_doc_references(conn, doc_id, references)
             update_fts(fts_conn, doc_id, title, content)
+            upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
             write_sidecar(
                 slug=slug,
                 title=title,
@@ -1543,10 +1597,12 @@ def new_doc():
             )
             conn.commit()
             fts_conn.commit()
+            token_conn.commit()
             invalidate_tag_recommendation_cache()
         except Exception:
             conn.rollback()
             fts_conn.rollback()
+            token_conn.rollback()
             raise
         return redirect(url_for("view_doc", slug=slug))
 
@@ -1568,6 +1624,7 @@ def new_doc():
 def edit_doc(slug: str):
     conn = get_db()
     fts_conn = get_fts_db()
+    token_conn = get_token_db()
     row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         abort(404)
@@ -1588,6 +1645,7 @@ def edit_doc(slug: str):
             return recommend_tags(
                 conn,
                 fts_conn,
+                token_conn,
                 title=new_title or row["title"],
                 content=new_content,
                 current_slug=row["slug"],
@@ -1676,6 +1734,7 @@ def edit_doc(slug: str):
             set_doc_tags(conn, row["id"], new_tags)
             set_doc_references(conn, row["id"], references)
             update_fts(fts_conn, row["id"], new_title, new_content)
+            upsert_language_doc_tokens(token_conn, conn, row["id"], new_title, new_content)
             write_sidecar(
                 slug=new_slug,
                 title=new_title,
@@ -1687,10 +1746,12 @@ def edit_doc(slug: str):
             )
             conn.commit()
             fts_conn.commit()
+            token_conn.commit()
             invalidate_tag_recommendation_cache()
         except Exception:
             conn.rollback()
             fts_conn.rollback()
+            token_conn.rollback()
             rollback_document_asset_moves(moved_assets)
             raise
         return redirect(url_for("view_doc", slug=new_slug))
@@ -1708,6 +1769,7 @@ def edit_doc(slug: str):
         recommended_tags=recommend_tags(
             conn,
             fts_conn,
+            token_conn,
             title=doc["title"],
             content=current_content,
             current_slug=doc["slug"],
@@ -1721,6 +1783,7 @@ def edit_doc(slug: str):
 def delete_doc(slug: str):
     conn = get_db()
     fts_conn = get_fts_db()
+    token_conn = get_token_db()
     row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         abort(404)
@@ -1728,12 +1791,15 @@ def delete_doc(slug: str):
     try:
         fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
         conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
+        delete_language_doc_tokens(token_conn, conn, row["id"])
         conn.commit()
         fts_conn.commit()
+        token_conn.commit()
         invalidate_tag_recommendation_cache()
     except Exception:
         conn.rollback()
         fts_conn.rollback()
+        token_conn.rollback()
         raise
 
     md = document_path(slug)
@@ -1871,6 +1937,7 @@ def tag_suggestions():
     suggestions = recommend_tags(
         conn,
         fts_conn,
+        get_token_db(),
         title=title,
         content=content,
         current_slug=current_slug,
@@ -1900,6 +1967,7 @@ def bootstrap() -> None:
     acquire_data_lock()
     init_db()
     init_fts_db()
+    init_token_db()
     sync_documents_on_startup()
     ensure_default_home()
 
