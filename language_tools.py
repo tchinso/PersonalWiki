@@ -11,6 +11,7 @@ from functools import lru_cache
 
 ENGLISH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{2,}(?![A-Za-z0-9])")
 KOREAN_TOKEN_RE = re.compile(r"[가-힣]{2,}")
+KOREAN_CHAR_RE = re.compile(r"[가-힣]")
 ENGLISH_STOPWORDS = {
     "the",
     "a",
@@ -216,12 +217,17 @@ _TAG_RECOMMEND_CACHE: dict[str, object] = {
     "idf_by_token": {},
     "df_by_token": {},
 }
-TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v1"
+TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v2-adaptive-tf"
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
 TAG_RECOMMEND_RANK_WEIGHT_EXPONENT = 1.7
-TAG_RECOMMEND_MAX_TOKENS_PER_DOC = 512
+TAG_RECOMMEND_MIN_TOKENS_PER_DOC = 512
+TAG_RECOMMEND_MID_TOKENS_PER_DOC = 768
+TAG_RECOMMEND_MAX_TOKENS_PER_DOC = 1024
+TAG_RECOMMEND_ADAPTIVE_MID_INDEX = 300
+TAG_RECOMMEND_ADAPTIVE_MAX_INDEX = 400
+TAG_RECOMMEND_ADAPTIVE_MIN_TF = 2
 TAG_RECOMMEND_FTS_CANDIDATE_LIMIT = 250
 TAG_RECOMMEND_FTS_MAX_QUERY_TERMS = 50
 TAG_RECOMMEND_TOKEN_DB_MAX_QUERY_TERMS = 50
@@ -603,7 +609,7 @@ def is_low_value_numeric_token(token: str) -> bool:
 
 
 def is_korean_token(token: str) -> bool:
-    return KOREAN_TOKEN_RE.fullmatch(token) is not None
+    return KOREAN_CHAR_RE.search(token) is not None
 
 
 def tokenize_text(text: str) -> list[str]:
@@ -647,30 +653,62 @@ def compute_tag_recommendation_idf(total_docs: int, df: int) -> float:
     return idf_base ** TAG_RECOMMEND_IDF_EXPONENT
 
 
+def tag_recommend_token_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
+    token, tf = item
+    korean_priority = 0 if is_korean_token(token) else 1
+    return (-int(tf), korean_priority, token)
+
+
+def sorted_tf_items(tf_counter: Counter[str], limit: int | None = None) -> list[tuple[str, int]]:
+    items = sorted(tf_counter.items(), key=tag_recommend_token_sort_key)
+    if limit is not None:
+        return items[:limit]
+    return items
+
+
 def limit_tf_counter(tf_counter: Counter[str], max_tokens: int) -> Counter[str]:
     if max_tokens <= 0 or len(tf_counter) <= max_tokens:
         return tf_counter
-    token_order = {token: index for index, token in enumerate(tf_counter)}
-    sorted_tokens = sorted(
-        tf_counter.items(),
-        key=lambda item: (
-            -item[1],
-            0 if is_korean_token(item[0]) else 1,
-            token_order[item[0]],
-        ),
-    )
-    limited_counter: Counter[str] = Counter()
-    for token, tf in sorted_tokens[:max_tokens]:
-        limited_counter[token] = tf
-    return limited_counter
+    return Counter(dict(sorted_tf_items(tf_counter, max_tokens)))
+
+
+def choose_content_token_limit(tf_counter: Counter[str]) -> int:
+    if not tf_counter:
+        return TAG_RECOMMEND_MIN_TOKENS_PER_DOC
+
+    ranked = sorted_tf_items(tf_counter, TAG_RECOMMEND_MAX_TOKENS_PER_DOC)
+
+    max_index = TAG_RECOMMEND_ADAPTIVE_MAX_INDEX - 1
+    if (
+        len(ranked) > max_index
+        and ranked[max_index][1] >= TAG_RECOMMEND_ADAPTIVE_MIN_TF
+    ):
+        return TAG_RECOMMEND_MAX_TOKENS_PER_DOC
+
+    mid_index = TAG_RECOMMEND_ADAPTIVE_MID_INDEX - 1
+    if (
+        len(ranked) > mid_index
+        and ranked[mid_index][1] >= TAG_RECOMMEND_ADAPTIVE_MIN_TF
+    ):
+        return TAG_RECOMMEND_MID_TOKENS_PER_DOC
+
+    return TAG_RECOMMEND_MIN_TOKENS_PER_DOC
+
+
+def limit_tf_counter_adaptive(tf_counter: Counter[str]) -> Counter[str]:
+    if not tf_counter:
+        return tf_counter
+
+    limit = choose_content_token_limit(tf_counter)
+    if limit <= 0 or len(tf_counter) <= limit:
+        return tf_counter
+
+    return Counter(dict(sorted_tf_items(tf_counter, limit)))
 
 
 def compute_doc_token_counters(title: str, content: str) -> dict[str, Counter[str]]:
     title_counter = Counter(tokenize_text(title))
-    content_counter = limit_tf_counter(
-        Counter(tokenize_text(content)),
-        TAG_RECOMMEND_MAX_TOKENS_PER_DOC,
-    )
+    content_counter = limit_tf_counter_adaptive(Counter(tokenize_text(content)))
     return {
         "title": title_counter,
         "content": content_counter,
