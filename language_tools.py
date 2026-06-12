@@ -90,6 +90,7 @@ ENGLISH_STOPWORDS = {
     "mkv",
     "bat",
     "ps1",
+    "txt",
     "html",
     "mhtml",
     "htm",
@@ -217,7 +218,11 @@ _TAG_RECOMMEND_CACHE: dict[str, object] = {
     "idf_by_token": {},
     "df_by_token": {},
 }
-TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v2-adaptive-tf"
+MARKDOWN_EMBED_IGNORE_SPAN_RE = re.compile(
+    r"!\[\[[^\]\r\n]*\]\]|!\[[^\]\r\n]*\]\([^\r\n)]*\)"
+)
+
+TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v3-ignore-markdown-embeds"
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
@@ -612,10 +617,18 @@ def is_korean_token(token: str) -> bool:
     return KOREAN_CHAR_RE.search(token) is not None
 
 
-def tokenize_text(text: str) -> list[str]:
-    tokens: list[str] = []
-    lowered = text.lower()
+def iter_tokenizable_segments(text: str):
+    start = 0
+    for match in MARKDOWN_EMBED_IGNORE_SPAN_RE.finditer(text):
+        if match.start() > start:
+            yield text[start : match.start()]
+        start = max(start, match.end())
+    if start < len(text):
+        yield text[start:]
 
+
+def append_tokens_from_segment(tokens: list[str], segment: str) -> None:
+    lowered = segment.lower()
     for raw in ENGLISH_TOKEN_RE.findall(lowered):
         token = singularize_token(raw)
         if is_low_value_numeric_token(token):
@@ -631,6 +644,12 @@ def tokenize_text(text: str) -> list[str]:
         if len(token) < 2:
             continue
         tokens.append(token)
+
+
+def tokenize_text(text: str) -> list[str]:
+    tokens: list[str] = []
+    for segment in iter_tokenizable_segments(text):
+        append_tokens_from_segment(tokens, segment)
     return tokens
 
 
@@ -798,9 +817,52 @@ def _get_main_doc_count(conn: sqlite3.Connection) -> int:
     return int(row["c"]) if row is not None else 0
 
 
+def build_language_index_source_signature(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS docs_count,
+            COALESCE(MAX(updated_at), '') AS docs_max_updated_at,
+            COALESCE(SUM(id), 0) AS docs_id_sum,
+            COALESCE(SUM(LENGTH(title)), 0) AS title_length_sum,
+            COALESCE(SUM(LENGTH(slug)), 0) AS slug_length_sum
+        FROM docs
+        """
+    ).fetchone()
+    if row is None:
+        return "docs-v1|0||||"
+    return "|".join(
+        (
+            "docs-v1",
+            str(int(row["docs_count"])),
+            str(row["docs_max_updated_at"]),
+            str(int(row["docs_id_sum"])),
+            str(int(row["title_length_sum"])),
+            str(int(row["slug_length_sum"])),
+        )
+    )
+
+
 def _set_language_total_docs_and_version(conn: sqlite3.Connection, total_docs: int) -> None:
     _set_language_meta(conn, "total_docs", total_docs)
     _set_language_meta(conn, "tokenizer_version", TAG_RECOMMEND_TOKENIZER_VERSION)
+
+
+def _set_language_source_signature(token_conn: sqlite3.Connection, main_conn: sqlite3.Connection) -> None:
+    _set_language_meta(
+        token_conn,
+        "source_signature",
+        build_language_index_source_signature(main_conn),
+    )
+
+
+def finalize_language_token_batch(token_conn: sqlite3.Connection, main_conn: sqlite3.Connection) -> None:
+    ensure_language_token_tables(token_conn)
+    total_docs = _get_main_doc_count(main_conn)
+    _recompute_language_token_idfs(token_conn, total_docs)
+    _set_language_total_docs_and_version(token_conn, total_docs)
+    _set_language_source_signature(token_conn, main_conn)
+    invalidate_tag_recommendation_cache()
 
 
 def get_existing_doc_token_set(conn: sqlite3.Connection, doc_id: int) -> set[str]:
@@ -897,6 +959,8 @@ def upsert_language_doc_tokens(
     doc_id: int,
     title: str,
     content: str,
+    *,
+    refresh_idf: bool = True,
 ) -> None:
     ensure_language_token_tables(token_conn)
     old_token_set = get_existing_doc_token_set(token_conn, doc_id)
@@ -921,18 +985,22 @@ def upsert_language_doc_tokens(
             rows,
         )
 
-    if stored_total_docs != total_docs:
-        _recompute_language_token_idfs(token_conn, total_docs)
-    else:
-        _recompute_language_token_idfs(token_conn, total_docs, removed_tokens | added_tokens)
-    _set_language_total_docs_and_version(token_conn, total_docs)
-    invalidate_tag_recommendation_cache()
+    if refresh_idf:
+        if stored_total_docs != total_docs:
+            _recompute_language_token_idfs(token_conn, total_docs)
+        else:
+            _recompute_language_token_idfs(token_conn, total_docs, removed_tokens | added_tokens)
+        _set_language_total_docs_and_version(token_conn, total_docs)
+        _set_language_source_signature(token_conn, main_conn)
+        invalidate_tag_recommendation_cache()
 
 
 def delete_language_doc_tokens(
     token_conn: sqlite3.Connection,
     main_conn: sqlite3.Connection,
     doc_id: int,
+    *,
+    refresh_idf: bool = True,
 ) -> None:
     ensure_language_token_tables(token_conn)
     old_token_set = get_existing_doc_token_set(token_conn, doc_id)
@@ -941,12 +1009,14 @@ def delete_language_doc_tokens(
 
     _decrement_language_token_dfs(token_conn, old_token_set)
     token_conn.execute("DELETE FROM language_doc_tokens WHERE doc_id = ?", (doc_id,))
-    if stored_total_docs != total_docs:
-        _recompute_language_token_idfs(token_conn, total_docs)
-    else:
-        _recompute_language_token_idfs(token_conn, total_docs, old_token_set)
-    _set_language_total_docs_and_version(token_conn, total_docs)
-    invalidate_tag_recommendation_cache()
+    if refresh_idf:
+        if stored_total_docs != total_docs:
+            _recompute_language_token_idfs(token_conn, total_docs)
+        else:
+            _recompute_language_token_idfs(token_conn, total_docs, old_token_set)
+        _set_language_total_docs_and_version(token_conn, total_docs)
+        _set_language_source_signature(token_conn, main_conn)
+        invalidate_tag_recommendation_cache()
 
 
 def rebuild_language_token_index(
@@ -1013,6 +1083,7 @@ def rebuild_language_token_index(
             stats_rows,
         )
     _set_language_total_docs_and_version(token_conn, total_docs)
+    _set_language_source_signature(token_conn, main_conn)
     _set_language_meta(token_conn, "last_rebuild_at", datetime.now().isoformat(timespec="seconds"))
     invalidate_tag_recommendation_cache()
     return total_docs, len(stats_rows)
@@ -1026,11 +1097,15 @@ def language_token_index_needs_rebuild(
     total_docs = _get_main_doc_count(main_conn)
     tokenizer_version = _get_language_meta(token_conn, "tokenizer_version")
     stored_total_docs = _get_stored_language_total_docs(token_conn)
+    stored_source_signature = _get_language_meta(token_conn, "source_signature")
+    current_source_signature = build_language_index_source_signature(main_conn)
     token_row = token_conn.execute("SELECT COUNT(*) AS c FROM language_doc_tokens").fetchone()
     token_row_count = int(token_row["c"]) if token_row is not None else 0
     if tokenizer_version != TAG_RECOMMEND_TOKENIZER_VERSION:
         return True
     if stored_total_docs != total_docs:
+        return True
+    if stored_source_signature != current_source_signature:
         return True
     if total_docs > 0 and token_row_count == 0:
         return True

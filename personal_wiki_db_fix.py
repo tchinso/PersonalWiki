@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from markdown_engine import extract_reference_targets
-from language_tools import ensure_language_token_tables, rebuild_language_token_index
+from language_tools import build_language_index_source_signature, ensure_language_token_tables, rebuild_language_token_index
 
 
 def runtime_data_dir() -> Path:
@@ -303,6 +303,38 @@ def init_fts_db(conn: sqlite3.Connection) -> None:
         USING fts5(title, content)
         """
     )
+    ensure_fts_index_meta_table(conn)
+
+
+def ensure_fts_index_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fts_index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def set_fts_index_meta(conn: sqlite3.Connection, key: str, value: object) -> None:
+    ensure_fts_index_meta_table(conn)
+    conn.execute(
+        """
+        INSERT INTO fts_index_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def mark_fts_index_current(main_conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> None:
+    set_fts_index_meta(
+        fts_conn,
+        "source_signature",
+        build_language_index_source_signature(main_conn),
+    )
 
 
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
@@ -549,6 +581,7 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
                 print(f"[WARN] skipped {md_file.name}: {error}")
 
         _token_docs, token_terms = rebuild_language_token_index(token_conn, main_conn, fts_conn)
+        mark_fts_index_current(main_conn, fts_conn)
         main_conn.commit()
         fts_conn.commit()
         token_conn.commit()

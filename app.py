@@ -31,13 +31,17 @@ from markdown_engine import MarkdownEngine, extract_reference_targets
 from language_tools import (
     TAG_RECOMMEND_LIMIT,
     apply_korean_spell_autofix,
+    build_language_index_source_signature,
     collect_korean_spell_issues,
     delete_language_doc_tokens,
     ensure_language_token_index_current,
     ensure_language_token_tables,
+    finalize_language_token_batch,
     invalidate_tag_recommendation_cache,
     korean_spell_warning_message,
+    language_token_index_needs_rebuild,
     recommend_tags,
+    rebuild_language_token_index,
     upsert_language_doc_tokens,
 )
 
@@ -79,7 +83,7 @@ app.config["JSON_AS_ASCII"] = False
 
 markdown_engine = MarkdownEngine()
 
-DIRTY_MTIME_GRACE_SECONDS = 5.0
+DIRTY_MTIME_GRACE_SECONDS = 1.0
 SEVERE_DIFF_MIN_CHANGES = 50
 SEVERE_DIFF_RATIO = 0.9
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
@@ -314,6 +318,7 @@ def init_fts_db() -> None:
             USING fts5(title, content)
             """
         )
+        ensure_fts_index_meta_table(conn)
         conn.commit()
 
 
@@ -321,6 +326,53 @@ def init_token_db() -> None:
     with closing(connect_token_db()) as conn:
         ensure_language_token_tables(conn)
         conn.commit()
+
+
+def ensure_fts_index_meta_table(fts_conn: sqlite3.Connection) -> None:
+    fts_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fts_index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def get_fts_index_meta(fts_conn: sqlite3.Connection, key: str) -> str | None:
+    ensure_fts_index_meta_table(fts_conn)
+    row = fts_conn.execute(
+        "SELECT value FROM fts_index_meta WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return str(row["value"]) if row is not None else None
+
+
+def set_fts_index_meta(fts_conn: sqlite3.Connection, key: str, value: object) -> None:
+    ensure_fts_index_meta_table(fts_conn)
+    fts_conn.execute(
+        """
+        INSERT INTO fts_index_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def mark_fts_index_current(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> None:
+    set_fts_index_meta(
+        fts_conn,
+        "source_signature",
+        build_language_index_source_signature(conn),
+    )
+
+
+def fts_index_needs_rebuild(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> bool:
+    stored_signature = get_fts_index_meta(fts_conn, "source_signature")
+    if stored_signature is None:
+        return False
+    return stored_signature != build_language_index_source_signature(conn)
 
 
 def safe_load_json(raw: str) -> dict:
@@ -1068,6 +1120,8 @@ def sync_new_doc(
     slug: str,
     md_file: Path,
     mtime: float,
+    refresh_token_idf: bool = True,
+    mark_fts_current: bool = True,
 ) -> None:
     content = read_text_normalized(md_file)
     references = extract_reference_payload(content)
@@ -1109,7 +1163,9 @@ def sync_new_doc(
     set_doc_tags(conn, doc_id, tags)
     set_doc_references(conn, doc_id, references)
     update_fts(fts_conn, doc_id, title, content)
-    upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
+    upsert_language_doc_tokens(token_conn, conn, doc_id, title, content, refresh_idf=refresh_token_idf)
+    if mark_fts_current:
+        mark_fts_index_current(conn, fts_conn)
     write_sidecar(
         slug=slug,
         title=title,
@@ -1129,6 +1185,8 @@ def sync_modified_doc(
     row: sqlite3.Row,
     md_file: Path,
     mtime: float,
+    refresh_token_idf: bool = True,
+    mark_fts_current: bool = True,
 ) -> None:
     slug = str(row["slug"])
     doc_id = int(row["id"])
@@ -1161,7 +1219,9 @@ def sync_modified_doc(
     tags = list_doc_tags(conn, doc_id)
     set_doc_references(conn, doc_id, references)
     update_fts(fts_conn, doc_id, current_title, content)
-    upsert_language_doc_tokens(token_conn, conn, doc_id, current_title, content)
+    upsert_language_doc_tokens(token_conn, conn, doc_id, current_title, content, refresh_idf=refresh_token_idf)
+    if mark_fts_current:
+        mark_fts_index_current(conn, fts_conn)
     write_sidecar(
         slug=slug,
         title=current_title,
@@ -1179,18 +1239,24 @@ def sync_deleted_doc(
     token_conn: sqlite3.Connection,
     *,
     row: sqlite3.Row,
+    refresh_token_idf: bool = True,
+    mark_fts_current: bool = True,
 ) -> None:
     doc_id = int(row["id"])
     fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
     conn.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
-    delete_language_doc_tokens(token_conn, conn, doc_id)
+    delete_language_doc_tokens(token_conn, conn, doc_id, refresh_idf=refresh_token_idf)
+    if mark_fts_current:
+        mark_fts_index_current(conn, fts_conn)
 
 
 def repair_fts_mismatch(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
     token_conn: sqlite3.Connection,
-) -> tuple[int, int]:
+    *,
+    force_rebuild: bool = False,
+) -> tuple[int, int, int]:
     doc_rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
     fts_rows = fts_conn.execute("SELECT rowid FROM docs_fts").fetchall()
 
@@ -1205,12 +1271,35 @@ def repair_fts_mismatch(
         row = docs_by_id[doc_id]
         content = read_document_if_exists(str(row["slug"])) or ""
         update_fts(fts_conn, doc_id, str(row["title"]), content)
-        upsert_language_doc_tokens(token_conn, conn, doc_id, str(row["title"]), content)
+        upsert_language_doc_tokens(
+            token_conn,
+            conn,
+            doc_id,
+            str(row["title"]),
+            content,
+            refresh_idf=False,
+        )
 
     for doc_id in orphan_ids:
         fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_id,))
 
-    return len(missing_ids), len(orphan_ids)
+    rebuilt_count = 0
+    if force_rebuild:
+        rebuilt_count = rebuild_fts_index_from_docs(conn, fts_conn)
+    else:
+        mark_fts_index_current(conn, fts_conn)
+
+    return len(missing_ids), len(orphan_ids), rebuilt_count
+
+
+def rebuild_fts_index_from_docs(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> int:
+    rows = conn.execute("SELECT id, title, slug FROM docs ORDER BY id").fetchall()
+    fts_conn.execute("DELETE FROM docs_fts")
+    for row in rows:
+        content = read_document_if_exists(str(row["slug"])) or ""
+        update_fts(fts_conn, int(row["id"]), str(row["title"]), content)
+    mark_fts_index_current(conn, fts_conn)
+    return len(rows)
 
 
 def sync_documents_incremental() -> dict[str, int]:
@@ -1218,8 +1307,16 @@ def sync_documents_incremental() -> dict[str, int]:
         md_snapshot = build_markdown_snapshot()
         db_snapshot = build_db_snapshot(conn)
         new_slugs, deleted_slugs, modified_slugs = detect_incremental_changes(md_snapshot, db_snapshot)
+        fts_rebuild_needed_before_changes = fts_index_needs_rebuild(conn, fts_conn)
+        token_rebuild_needed_before_changes = language_token_index_needs_rebuild(token_conn, conn)
 
         total_changes = len(new_slugs) + len(deleted_slugs) + len(modified_slugs)
+        doc_count_changed = bool(new_slugs or deleted_slugs)
+        refresh_modified_tokens_incrementally = (
+            bool(modified_slugs)
+            and not doc_count_changed
+            and not token_rebuild_needed_before_changes
+        )
         if len(md_snapshot) != len(db_snapshot):
             print(f"[SYNC] count mismatch detected md={len(md_snapshot)} db={len(db_snapshot)}")
         if is_severe_divergence(
@@ -1235,31 +1332,74 @@ def sync_documents_incremental() -> dict[str, int]:
         for slug in new_slugs:
             md_file = md_snapshot[slug]["path"]
             mtime = float(md_snapshot[slug]["mtime"])
-            sync_new_doc(conn, fts_conn, token_conn, slug=slug, md_file=md_file, mtime=mtime)
+            sync_new_doc(
+                conn,
+                fts_conn,
+                token_conn,
+                slug=slug,
+                md_file=md_file,
+                mtime=mtime,
+                refresh_token_idf=False,
+                mark_fts_current=False,
+            )
 
         for slug in modified_slugs:
             md_file = md_snapshot[slug]["path"]
             mtime = float(md_snapshot[slug]["mtime"])
             row = db_snapshot[slug]
-            sync_modified_doc(conn, fts_conn, token_conn, row=row, md_file=md_file, mtime=mtime)
+            sync_modified_doc(
+                conn,
+                fts_conn,
+                token_conn,
+                row=row,
+                md_file=md_file,
+                mtime=mtime,
+                refresh_token_idf=refresh_modified_tokens_incrementally,
+                mark_fts_current=False,
+            )
 
         for slug in deleted_slugs:
-            sync_deleted_doc(conn, fts_conn, token_conn, row=db_snapshot[slug])
+            sync_deleted_doc(
+                conn,
+                fts_conn,
+                token_conn,
+                row=db_snapshot[slug],
+                refresh_token_idf=False,
+                mark_fts_current=False,
+            )
 
-        fts_missing, fts_orphan = repair_fts_mismatch(conn, fts_conn, token_conn)
+        fts_missing, fts_orphan, fts_rebuilt = repair_fts_mismatch(
+            conn,
+            fts_conn,
+            token_conn,
+            force_rebuild=fts_rebuild_needed_before_changes,
+        )
         sidecar_repaired = repair_sidecar_mismatches(conn)
-        token_rebuilt, token_docs, token_terms = ensure_language_token_index_current(token_conn, conn, fts_conn)
+        deferred_token_idf = (
+            doc_count_changed
+            or fts_missing > 0
+            or fts_rebuilt > 0
+            or (bool(modified_slugs) and not refresh_modified_tokens_incrementally)
+        )
+        if fts_rebuilt > 0:
+            token_docs, token_terms = rebuild_language_token_index(token_conn, conn, fts_conn)
+            token_rebuilt = True
+        else:
+            if deferred_token_idf and not token_rebuild_needed_before_changes:
+                finalize_language_token_batch(token_conn, conn)
+            token_rebuilt, token_docs, token_terms = ensure_language_token_index_current(token_conn, conn, fts_conn)
 
         conn.commit()
         fts_conn.commit()
         token_conn.commit()
-        if total_changes > 0 or fts_missing > 0 or fts_orphan > 0 or token_rebuilt:
+        if total_changes > 0 or fts_missing > 0 or fts_orphan > 0 or fts_rebuilt > 0 or token_rebuilt:
             invalidate_tag_recommendation_cache()
 
         print(
             "[SYNC] startup incremental sync "
             f"new={len(new_slugs)} deleted={len(deleted_slugs)} modified={len(modified_slugs)} "
-            f"fts_missing={fts_missing} fts_orphan={fts_orphan} sidecar_repaired={sidecar_repaired} "
+            f"fts_missing={fts_missing} fts_orphan={fts_orphan} fts_rebuilt={fts_rebuilt} "
+            f"sidecar_repaired={sidecar_repaired} "
             f"token_rebuilt={token_rebuilt} token_docs={token_docs} token_terms={token_terms}"
         )
         return {
@@ -1268,6 +1408,7 @@ def sync_documents_incremental() -> dict[str, int]:
             "modified": len(modified_slugs),
             "fts_missing": fts_missing,
             "fts_orphan": fts_orphan,
+            "fts_rebuilt": fts_rebuilt,
             "sidecar_repaired": sidecar_repaired,
             "token_rebuilt": int(token_rebuilt),
             "token_docs": token_docs,
@@ -1392,6 +1533,7 @@ def ensure_default_home() -> None:
         set_doc_references(conn, doc_id, references)
         update_fts(fts_conn, doc_id, title, content)
         upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
+        mark_fts_index_current(conn, fts_conn)
         write_sidecar(
             slug=slug,
             title=title,
@@ -1586,6 +1728,7 @@ def new_doc():
             set_doc_references(conn, doc_id, references)
             update_fts(fts_conn, doc_id, title, content)
             upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
+            mark_fts_index_current(conn, fts_conn)
             write_sidecar(
                 slug=slug,
                 title=title,
@@ -1735,6 +1878,7 @@ def edit_doc(slug: str):
             set_doc_references(conn, row["id"], references)
             update_fts(fts_conn, row["id"], new_title, new_content)
             upsert_language_doc_tokens(token_conn, conn, row["id"], new_title, new_content)
+            mark_fts_index_current(conn, fts_conn)
             write_sidecar(
                 slug=new_slug,
                 title=new_title,
@@ -1792,6 +1936,7 @@ def delete_doc(slug: str):
         fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
         conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
         delete_language_doc_tokens(token_conn, conn, row["id"])
+        mark_fts_index_current(conn, fts_conn)
         conn.commit()
         fts_conn.commit()
         token_conn.commit()
