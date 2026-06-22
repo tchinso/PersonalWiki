@@ -10,6 +10,26 @@ if (-not $pythonCommand) {
 
 $pythonExe = $pythonCommand.Source
 $iconPath = (Resolve-Path "img\\icon.ico").Path
+$distDir = Join-Path (Get-Location) "dist\\PersonalWiki"
+$runtimeBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("PersonalWiki-build-backup-" + [guid]::NewGuid().ToString("N"))
+$hasRuntimeBackup = $false
+
+if (Test-Path -LiteralPath $distDir) {
+  New-Item -ItemType Directory -Path $runtimeBackup -Force | Out-Null
+  foreach ($directoryName in @("doc", "img", "file")) {
+    $source = Join-Path $distDir $directoryName
+    if (Test-Path -LiteralPath $source) {
+      Copy-Item -LiteralPath $source -Destination $runtimeBackup -Recurse -Force
+      $hasRuntimeBackup = $true
+    }
+  }
+  Get-ChildItem -LiteralPath $distDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "wiki*.db*" -or $_.Name -eq "wikisettings.cfg" } |
+    ForEach-Object {
+      Copy-Item -LiteralPath $_.FullName -Destination $runtimeBackup -Force
+      $hasRuntimeBackup = $true
+    }
+}
 
 Write-Host "[1/3] Installing dependencies..."
 & $pythonExe -m pip install -r requirements.txt
@@ -37,6 +57,24 @@ Write-Host "[3/3] Building PersonalWikiDBFix.exe (onefile) next to PersonalWiki.
   personal_wiki_db_fix.py
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller build for PersonalWikiDBFix failed."
+}
+
+foreach ($directoryName in @("doc", "img", "file")) {
+  New-Item -ItemType Directory -Path (Join-Path $distDir $directoryName) -Force | Out-Null
+}
+Copy-Item -Path "img\\*" -Destination (Join-Path $distDir "img") -Force
+Copy-Item -LiteralPath "wikisettings.cfg" -Destination (Join-Path $distDir "wikisettings.cfg") -Force
+
+if ($hasRuntimeBackup) {
+  Get-ChildItem -LiteralPath $runtimeBackup -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $distDir -Recurse -Force
+  }
+}
+
+$resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$resolvedBackup = [System.IO.Path]::GetFullPath($runtimeBackup)
+if ($resolvedBackup.StartsWith($resolvedTemp, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedBackup)) {
+  Remove-Item -LiteralPath $resolvedBackup -Recurse -Force
 }
 
 Write-Host "Build complete."

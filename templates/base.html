@@ -19,6 +19,7 @@
         <nav class="menu">
           <a href="{{ url_for('index') }}">문서 목록</a>
           <a href="{{ url_for('new_doc') }}">새 문서</a>
+          <a href="{{ url_for('package_tool') }}">내보내기</a>
         </nav>
         <form class="search-form" action="{{ url_for('search') }}" method="get">
           <input

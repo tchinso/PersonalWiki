@@ -2,6 +2,9 @@
 
 import json
 import atexit
+import base64
+import io
+import mimetypes
 import os
 import re
 import shutil
@@ -9,10 +12,12 @@ import sqlite3
 import subprocess
 import sys
 import unicodedata
+import zipfile
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, unquote, urlsplit
 
 from flask import (
     Flask,
@@ -22,6 +27,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     send_from_directory,
     url_for,
 )
@@ -89,6 +95,12 @@ SEVERE_DIFF_RATIO = 0.9
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6885
+SETTINGS_PATH = DATA_DIR / "wikisettings.cfg"
+LOCAL_ASSET_URL_RE = re.compile(
+    r"(?P<prefix>\b(?:src|href)\s*=\s*)(?P<quote>['\"])(?P<url>/(?:img|file)/[^'\"?#]*)(?P=quote)",
+    flags=re.IGNORECASE,
+)
+FILE_REFERENCE_RE = re.compile(r"\[\[\s*file/", flags=re.IGNORECASE)
 UNLINKABLE_TITLE_PREFIXES = ("http://", "https://", "file/")
 TITLE_LINK_LIMIT_WARNING = (
     "이 문서는 위키 엔진 한계상 링크가 제대로 동작하지 않을 수 있습니다. "
@@ -98,6 +110,30 @@ TITLE_LINK_LIMIT_WARNING = (
 
 class StartupRecoveryNeeded(RuntimeError):
     pass
+
+
+class ExportError(ValueError):
+    pass
+
+
+def read_server_port(settings_path: Path = SETTINGS_PATH) -> int:
+    """Read port=<number> from wikisettings.cfg, falling back safely."""
+    try:
+        raw = settings_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return DEFAULT_PORT
+
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key.casefold() != "port" or not value.isascii() or not value.isdigit():
+            continue
+        port = int(value)
+        if 1 <= port <= 65535:
+            return port
+    return DEFAULT_PORT
 
 
 def _lock_file_handle(handle) -> None:
@@ -927,6 +963,175 @@ def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
         read_document=read_document_if_exists,
     )
     return Markup(html)
+
+
+def parse_export_doc_address(raw_address: str) -> str:
+    address = str(raw_address or "").strip()
+    if not address:
+        raise ExportError("내보낼 문서 주소를 입력해 주세요.")
+
+    if address.startswith("/"):
+        parsed = urlsplit(address)
+    else:
+        parsed = urlsplit(address if "://" in address else f"http://{address}")
+        if parsed.scheme.casefold() not in {"http", "https"}:
+            raise ExportError("http 또는 https 형식의 문서 주소만 사용할 수 있습니다.")
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ExportError("이 PersonalWiki의 로컬 문서 주소만 내보낼 수 있습니다.")
+        if parsed.username or parsed.password:
+            raise ExportError("사용자 정보가 포함된 주소는 사용할 수 없습니다.")
+        try:
+            parsed.port
+        except ValueError as error:
+            raise ExportError("포트 번호가 올바르지 않습니다.") from error
+
+    path = unquote(parsed.path)
+    if not path.startswith("/doc/"):
+        raise ExportError("주소는 /doc/문서주소 형식이어야 합니다.")
+    slug = path[len("/doc/") :].strip("/")
+    if not slug or "\0" in slug:
+        raise ExportError("문서 주소에 문서명이 없습니다.")
+    if any(part in {".", ".."} for part in PurePosixPath(slug).parts):
+        raise ExportError("안전하지 않은 문서 경로는 사용할 수 없습니다.")
+    return slug
+
+
+def _export_asset_path(url: str) -> tuple[str, Path, PurePosixPath]:
+    decoded = unquote(url)
+    if decoded.startswith("/img/"):
+        kind = "img"
+        root = IMG_DIR
+        relative_raw = decoded[len("/img/") :]
+    elif decoded.startswith("/file/"):
+        kind = "file"
+        root = FILE_DIR
+        relative_raw = decoded[len("/file/") :]
+    else:
+        raise ExportError(f"지원하지 않는 로컬 자산 주소입니다: {url}")
+
+    relative = PurePosixPath(relative_raw.replace("\\", "/"))
+    if not relative.parts or relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ExportError(f"안전하지 않은 자산 경로입니다: {url}")
+    source = root.joinpath(*relative.parts).resolve()
+    try:
+        source.relative_to(root.resolve())
+    except ValueError as error:
+        raise ExportError(f"안전하지 않은 자산 경로입니다: {url}") from error
+    if not source.is_file():
+        raise ExportError(f"문서가 참조하는 파일을 찾을 수 없습니다: {decoded}")
+    return kind, source, relative
+
+
+def _rewrite_local_asset_urls(html_text: str, replacer) -> str:
+    def replace_match(match: re.Match[str]) -> str:
+        rewritten = replacer(match.group("url"))
+        return f'{match.group("prefix")}{match.group("quote")}{rewritten}{match.group("quote")}'
+
+    return LOCAL_ASSET_URL_RE.sub(replace_match, html_text)
+
+
+def _export_document_shell(
+    doc: dict,
+    rendered_content: str,
+    *,
+    stylesheet: str,
+    script: str,
+    inline_assets: bool,
+) -> str:
+    safe_title = str(Markup.escape(str(doc["title"])))
+    safe_created = str(Markup.escape(str(doc.get("created_at", ""))))
+    safe_updated = str(Markup.escape(str(doc.get("updated_at", ""))))
+    tags = "".join(
+        f'<span class="tag">#{Markup.escape(str(tag))}</span>'
+        for tag in doc.get("tags", [])
+    )
+    if inline_assets:
+        style_tag = f"<style>\n{stylesheet}\n</style>"
+        script_tag = f"<script>\n{script}\n</script>"
+    else:
+        style_tag = f'<link rel="stylesheet" href="{stylesheet}">'
+        script_tag = f'<script src="{script}" defer></script>'
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title} | Personal Wiki</title>
+  {style_tag}
+</head>
+<body class="app-shell page-exported-doc">
+  <main class="container">
+    <section class="panel">
+      <header class="doc-header">
+        <div>
+          <p class="eyebrow">Exported Document</p>
+          <h1>{safe_title}</h1>
+          <p class="muted">생성: {safe_created} / 수정: {safe_updated}</p>
+          <div class="tag-row">{tags}</div>
+        </div>
+      </header>
+      <article class="markdown-body">{rendered_content}</article>
+    </section>
+  </main>
+  {script_tag}
+</body>
+</html>
+"""
+
+
+def build_single_html_export(doc: dict, rendered_content: str) -> bytes:
+    css = read_text_normalized(STATIC_DIR / "style.css")
+    script = read_text_normalized(STATIC_DIR / "wiki.js")
+
+    def embed_image(url: str) -> str:
+        kind, source, _relative = _export_asset_path(url)
+        if kind == "file":
+            return url
+        mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}"
+
+    rewritten = _rewrite_local_asset_urls(rendered_content, embed_image)
+    html_text = _export_document_shell(
+        doc,
+        rewritten,
+        stylesheet=css,
+        script=script,
+        inline_assets=True,
+    )
+    return html_text.encode("utf-8")
+
+
+def build_zip_export(doc: dict, rendered_content: str) -> bytes:
+    output = io.BytesIO()
+    copied: set[str] = set()
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        def package_asset(url: str) -> str:
+            kind, source, relative = _export_asset_path(url)
+            archive_name = PurePosixPath("assets", kind, *relative.parts).as_posix()
+            if archive_name not in copied:
+                archive.write(source, archive_name)
+                copied.add(archive_name)
+            return quote(archive_name, safe="/")
+
+        rewritten = _rewrite_local_asset_urls(rendered_content, package_asset)
+        archive.writestr("assets/style.css", (STATIC_DIR / "style.css").read_bytes())
+        archive.writestr("assets/wiki.js", (STATIC_DIR / "wiki.js").read_bytes())
+        archive.writestr(
+            "index.html",
+            _export_document_shell(
+                doc,
+                rewritten,
+                stylesheet="assets/style.css",
+                script="assets/wiki.js",
+                inline_assets=False,
+            ).encode("utf-8"),
+        )
+
+    output.seek(0)
+    return output.getvalue()
 
 
 def normalize_search_query(query: str) -> str:
@@ -2054,6 +2259,105 @@ def search():
     )
 
 
+@app.get("/tool/table")
+def table_editor():
+    return render_template("table_editor.html")
+
+
+def _load_export_document(address: str) -> tuple[dict, str]:
+    slug = parse_export_doc_address(address)
+    doc = fetch_doc_with_tags(get_db(), slug)
+    if doc is None:
+        raise ExportError("해당 주소의 문서를 찾을 수 없습니다.")
+    content = read_document_if_exists(str(doc["slug"]))
+    if content is None:
+        raise ExportError("문서 원본 파일을 찾을 수 없습니다.")
+    return doc, content
+
+
+@app.get("/tool/package")
+def package_tool():
+    return render_template(
+        "package_tool.html",
+        error=None,
+        document_address=f"http://{request.host}/doc/",
+        needs_confirmation=False,
+        pending_format="",
+    )
+
+
+@app.post("/api/package/check")
+def package_check():
+    payload = request.get_json(silent=True) or {}
+    address = str(payload.get("document_address", ""))
+    try:
+        doc, content = _load_export_document(address)
+    except ExportError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    file_count = len(FILE_REFERENCE_RE.findall(content))
+    return jsonify(
+        {
+            "ok": True,
+            "title": str(doc["title"]),
+            "has_files": file_count > 0,
+            "file_count": file_count,
+        }
+    )
+
+
+@app.post("/tool/package/export")
+def package_export():
+    address = request.form.get("document_address", "").strip()
+    export_format = request.form.get("export_format", "").strip().casefold()
+    confirmed_files = request.form.get("confirmed_files") == "1"
+    try:
+        doc, content = _load_export_document(address)
+        if export_format not in {"zip", "html"}:
+            raise ExportError("내보내기 형식을 선택해 주세요.")
+
+        has_file_references = FILE_REFERENCE_RE.search(content) is not None
+        if export_format == "html" and has_file_references and not confirmed_files:
+            return (
+                render_template(
+                    "package_tool.html",
+                    error="첨부 파일 링크([[file/... ]])는 단일 HTML에 포함되지 않습니다. 계속하려면 다시 확인해 주세요.",
+                    document_address=address,
+                    needs_confirmation=True,
+                    pending_format="html",
+                ),
+                409,
+            )
+
+        rendered = str(render_markdown(get_db(), content))
+        if export_format == "zip":
+            payload = build_zip_export(doc, rendered)
+            mimetype = "application/zip"
+            extension = "zip"
+        else:
+            payload = build_single_html_export(doc, rendered)
+            mimetype = "text/html; charset=utf-8"
+            extension = "html"
+    except (ExportError, OSError) as error:
+        return (
+            render_template(
+                "package_tool.html",
+                error=str(error),
+                document_address=address,
+                needs_confirmation=False,
+                pending_format=export_format,
+            ),
+            400,
+        )
+
+    return send_file(
+        io.BytesIO(payload),
+        as_attachment=True,
+        download_name=f"{doc['slug']}.{extension}",
+        mimetype=mimetype,
+        max_age=0,
+    )
+
+
 @app.post("/preview")
 def preview():
     conn = get_db()
@@ -2122,4 +2426,4 @@ if os.environ.get("PERSONALWIKI_SKIP_BOOTSTRAP") != "1":
 
 
 if __name__ == "__main__":
-    app.run(host=DEFAULT_HOST, port=DEFAULT_PORT, debug=False)
+    app.run(host=DEFAULT_HOST, port=read_server_port(), debug=False)

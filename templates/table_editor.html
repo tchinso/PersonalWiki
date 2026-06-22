@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block title %}마크다운 표 편집기 | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel tool-panel">
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Markdown Tool</p>
+      <h1>마크다운 표 편집기</h1>
+    </div>
+  </header>
+  <p class="muted">각 칸에 내용을 입력하세요. 칸 안의 줄바꿈은 생성할 때 &lt;br&gt;로 바뀝니다.</p>
+
+  <section class="table-import-box" aria-labelledby="table-import-title">
+    <label id="table-import-title" for="table-import">기존 마크다운 표 불러오기</label>
+    <textarea id="table-import" rows="3" placeholder="| 제목 1 | 제목 2 |&#10;| --- | --- |&#10;| 내용 1 | 내용 2 |"></textarea>
+    <div class="button-row">
+      <button class="button secondary" type="button" id="table-import-btn">불러오기</button>
+    </div>
+    <p class="tool-message" id="table-import-message" role="status" aria-live="polite"></p>
+  </section>
+
+  <div class="table-editor-scroll">
+    <table class="table-editor-grid" id="table-editor-grid" aria-label="마크다운 표 내용 편집"></table>
+  </div>
+
+  <div class="button-row table-generate-actions">
+    <button class="button" type="button" id="table-generate-btn">마크다운 표 생성</button>
+    <button class="button secondary" type="button" id="table-copy-btn">생성 결과 복사</button>
+  </div>
+
+  <label for="table-result">생성 결과</label>
+  <textarea id="table-result" rows="10" readonly placeholder="마크다운 표 생성 버튼을 누르면 여기에 결과가 표시됩니다."></textarea>
+  <p class="tool-message" id="table-result-message" role="status" aria-live="polite"></p>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{{ url_for('static', filename='table_editor.js') }}"></script>
+{% endblock %}

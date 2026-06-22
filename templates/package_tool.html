@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}문서 내보내기 | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel tool-panel">
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Export Tool</p>
+      <h1>문서 내보내기</h1>
+    </div>
+  </header>
+  <p class="muted">내보낼 로컬 문서 주소를 입력하고 원하는 형식을 선택하세요.</p>
+
+  {% if error %}
+    <p class="warning" id="package-server-error">{{ error }}</p>
+  {% endif %}
+
+  <form class="package-form" id="package-form" action="{{ url_for('package_export') }}" method="post">
+    <label for="document-address">문서 주소</label>
+    <input
+      id="document-address"
+      name="document_address"
+      type="text"
+      value="{{ document_address }}"
+      placeholder="http://127.0.0.1:6885/doc/문서주소"
+      required
+    >
+    <input type="hidden" name="confirmed_files" id="confirmed-files" value="{{ '1' if needs_confirmation else '0' }}">
+
+    <fieldset class="export-options">
+      <legend>내보내기 형식</legend>
+      <label class="export-option">
+        <input type="radio" name="export_format" value="zip" {% if pending_format != 'html' %}checked{% endif %}>
+        <span><strong>ZIP으로 내보내기</strong><small>HTML, 스타일, 이미지와 첨부 파일을 상대 경로로 묶습니다.</small></span>
+      </label>
+      <label class="export-option">
+        <input type="radio" name="export_format" value="html" {% if pending_format == 'html' %}checked{% endif %}>
+        <span><strong>HTML 파일로 내보내기</strong><small>스타일과 이미지를 한 HTML 파일에 포함합니다.</small></span>
+      </label>
+    </fieldset>
+
+    <div class="button-row">
+      <button class="button" type="submit" id="package-submit-btn">
+        {% if needs_confirmation %}경고를 확인하고 계속{% else %}내보내기{% endif %}
+      </button>
+    </div>
+    <p class="tool-message" id="package-message" role="status" aria-live="polite"></p>
+  </form>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{{ url_for('static', filename='package_tool.js') }}"></script>
+{% endblock %}
