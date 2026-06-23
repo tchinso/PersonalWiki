@@ -28,6 +28,8 @@
   --success: #22c55e;
   --warning: #f59e0b;
   --error: #ef4444;
+  --link: #0969da;
+  --link-hover: #0550ae;
   --radius-xs: 6px;
   --radius-sm: 8px;
   --radius-md: 12px;
@@ -652,6 +654,15 @@ textarea {
   max-width: 100%;
   overflow-wrap: break-word;
   color: var(--body);
+}
+
+.markdown-body a {
+  color: var(--link);
+}
+
+.markdown-body a:hover,
+.markdown-body a:focus-visible {
+  color: var(--link-hover);
 }
 
 .markdown-body > * + * {
