@@ -9,12 +9,40 @@ from unittest.mock import patch
 os.environ["PERSONALWIKI_SKIP_BOOTSTRAP"] = "1"
 
 import app
-from language_tools import apply_korean_spell_replacements
+from language_tools import KOREAN_SPELL_REPLACE_DB, apply_korean_spell_replacements
 
 
 class SpellReplacementTests(unittest.TestCase):
     def test_requested_replacements(self):
         pairs = {
+            "컨텐츠": "콘텐츠",
+            "다던지": "다든지",
+            "다던가": "다든가",
+            "는것": "는 것",
+            "는게": "는 게",
+            "여러가지": "여러 가지",
+            "을때": "을 때",
+            "일때": "일 때",
+            "할때": "할 때",
+            "된때": "된 때",
+            "던때": "던 때",
+            "이 때": "이때",
+            "그 때": "그때",
+            "한 때": "한때",
+            "을것": "을 것",
+            "일것": "일 것",
+            "할것": "할 것",
+            "된것": "된 것",
+            "던것": "던 것",
+            "린것": "린 것",
+            "치뤘다": "치렀다",
+            "기때문": "기 때문",
+            "한가지": "한 가지",
+            "번번히": "번번이",
+            "또 다시": "또다시",
+            "맞은 편": "맞은편",
+            "일려": "이려",
+            "할려": "하려",
             "않는이상": "않는 이상",
             "얼만큼": "얼마만큼",
             "뇌졸증": "뇌졸중",
@@ -39,6 +67,14 @@ class SpellReplacementTests(unittest.TestCase):
         for wrong, expected in pairs.items():
             with self.subTest(wrong=wrong):
                 self.assertEqual(apply_korean_spell_replacements(wrong), expected)
+
+    def test_database_is_sorted_longest_first(self):
+        lengths = [len(wrong) for wrong, _replacement in KOREAN_SPELL_REPLACE_DB]
+        self.assertEqual(lengths, sorted(lengths, reverse=True))
+
+    def test_correct_because_phrases_are_not_changed(self):
+        text = "이 때문에 늦었고 그 때문에 다시 확인했다."
+        self.assertEqual(apply_korean_spell_replacements(text), text)
 
 
 class SettingsTests(unittest.TestCase):
