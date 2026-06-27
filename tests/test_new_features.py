@@ -10,6 +10,7 @@ os.environ["PERSONALWIKI_SKIP_BOOTSTRAP"] = "1"
 
 import app
 from language_tools import KOREAN_SPELL_REPLACE_DB, apply_korean_spell_replacements
+from markdown_engine import MarkdownEngine, extract_reference_targets
 
 
 class SpellReplacementTests(unittest.TestCase):
@@ -53,6 +54,7 @@ class SpellReplacementTests(unittest.TestCase):
             "프롬포트": "프롬프트",
             "확율": "확률",
             "유렵": "유럽",
+            "스케쥴": "스케줄",
             "제 때": "제때",
             "이때문에": "이 때문에",
             "그 것": "그것",
@@ -94,6 +96,47 @@ class SettingsTests(unittest.TestCase):
                 path.write_text(raw, encoding="utf-8")
                 with self.subTest(raw=raw):
                     self.assertEqual(app.read_server_port(path), expected)
+
+
+class TocTests(unittest.TestCase):
+    def render(self, text):
+        engine = MarkdownEngine()
+        return engine.render(
+            text,
+            resolve_doc_reference=lambda _ref: None,
+            read_document=lambda _slug: None,
+        )
+
+    def test_default_toc_shows_heading_level_two(self):
+        rendered = self.render("{{TOC}}\n\n# One\n\n## Two\n\n### Three")
+        self.assertIn('<nav class="wiki-toc"', rendered)
+        self.assertIn('href="#one"', rendered)
+        self.assertIn('href="#two"', rendered)
+        self.assertNotIn('href="#three"', rendered)
+
+    def test_numbered_toc_limits_heading_depth(self):
+        toc1 = self.render("{{TOC1}}\n\n# One\n\n## Two")
+        toc3 = self.render("{{TOC3}}\n\n# One\n\n## Two\n\n### Three")
+        self.assertIn('href="#one"', toc1)
+        self.assertNotIn('href="#two"', toc1)
+        self.assertIn('href="#three"', toc3)
+
+    def test_toc_is_not_recorded_as_template_reference(self):
+        links, templates = extract_reference_targets("{{TOC}}\n{{TOC6}}\n{{RealTemplate}}")
+        self.assertEqual(links, [])
+        self.assertEqual(templates, ["RealTemplate"])
+
+
+class TitleWarningTests(unittest.TestCase):
+    def test_reserved_titles_warn(self):
+        for title in ["TOC", "toc3", "img/example"]:
+            with self.subTest(title=title):
+                self.assertIsNotNone(app.title_prefix_warning(title))
+
+    def test_similar_non_reserved_titles_do_not_warn(self):
+        for title in ["TOC7", "My TOC", "image/example"]:
+            with self.subTest(title=title):
+                self.assertIsNone(app.title_prefix_warning(title))
 
 
 class ExportTests(unittest.TestCase):

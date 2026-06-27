@@ -33,7 +33,7 @@ from flask import (
 )
 from markupsafe import Markup
 
-from markdown_engine import MarkdownEngine, extract_reference_targets
+from markdown_engine import MarkdownEngine, TOC_RESERVED_TITLES, extract_reference_targets
 from language_tools import (
     TAG_RECOMMEND_LIMIT,
     apply_korean_spell_autofix,
@@ -101,10 +101,11 @@ LOCAL_ASSET_URL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 FILE_REFERENCE_RE = re.compile(r"\[\[\s*file/", flags=re.IGNORECASE)
-UNLINKABLE_TITLE_PREFIXES = ("http://", "https://", "file/")
+UNLINKABLE_TITLE_PREFIXES = ("img/", "http://", "https://", "file/")
+UNLINKABLE_TITLE_NAMES = tuple(title.casefold() for title in TOC_RESERVED_TITLES)
 TITLE_LINK_LIMIT_WARNING = (
-    "이 문서는 위키 엔진 한계상 링크가 제대로 동작하지 않을 수 있습니다. "
-    "제목이 file/, http://, https:// 로 시작하면 위키 링크 해석이 충돌할 수 있습니다."
+    "이 문서는 위키 엔진 한계상 링크 또는 템플릿 해석이 제대로 동작하지 않을 수 있습니다. "
+    "제목이 img/, file/, http://, https:// 로 시작하거나 TOC, TOC1~TOC6이면 내장 문법과 충돌할 수 있습니다."
 )
 
 
@@ -771,7 +772,7 @@ def repair_sidecar_mismatches(conn: sqlite3.Connection) -> int:
 
 def has_unlinkable_title_prefix(title: str) -> bool:
     lowered = title.strip().casefold()
-    return any(lowered.startswith(prefix) for prefix in UNLINKABLE_TITLE_PREFIXES)
+    return lowered in UNLINKABLE_TITLE_NAMES or any(lowered.startswith(prefix) for prefix in UNLINKABLE_TITLE_PREFIXES)
 
 
 def title_prefix_warning(title: str) -> str | None:

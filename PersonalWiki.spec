@@ -32,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Codex_PersonalWiki\\img\\icon.ico'],
+    icon=['C:\\Users\\chuum\\OneDrive\\문서\\GitHub\\PersonalWiki\\img\\icon.ico'],
 )
 coll = COLLECT(
     exe,

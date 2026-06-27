@@ -671,8 +671,70 @@ textarea {
 
 .markdown-body h1,
 .markdown-body h2,
-.markdown-body h3 {
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
   margin-top: 28px;
+}
+
+.markdown-body .wiki-toc {
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.markdown-body .wiki-toc-title {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--body-strong);
+}
+
+.markdown-body .wiki-toc ol {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.markdown-body .wiki-toc li + li {
+  margin-top: 4px;
+}
+
+.markdown-body .wiki-toc a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+.markdown-body .wiki-toc a:hover,
+.markdown-body .wiki-toc a:focus-visible {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
+.markdown-body .wiki-toc-level-2 {
+  margin-left: 14px;
+}
+
+.markdown-body .wiki-toc-level-3 {
+  margin-left: 28px;
+}
+
+.markdown-body .wiki-toc-level-4 {
+  margin-left: 42px;
+}
+
+.markdown-body .wiki-toc-level-5 {
+  margin-left: 56px;
+}
+
+.markdown-body .wiki-toc-level-6 {
+  margin-left: 70px;
+}
+
+.markdown-body .wiki-toc-empty p {
+  margin: 0;
+  color: var(--muted);
 }
 
 .markdown-body img {

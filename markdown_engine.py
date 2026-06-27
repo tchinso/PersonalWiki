@@ -20,9 +20,21 @@ YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 EXTERNAL_WIKI_TARGET_RE = re.compile(r"^(https?|file)://", flags=re.IGNORECASE)
 FILE_WIKI_TARGET_RE = re.compile(r"^file/", flags=re.IGNORECASE)
 TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?(?P<dashes>-{3,}):?$")
+TOC_REF_RE = re.compile(r"^TOC(?P<level>[1-6])?$", flags=re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 WIKI_CONTEXT_KEY = "personal_wiki_context"
 TEMPLATE_DISABLED_KEY = "personal_wiki_template_disabled"
+TOC_RESERVED_TITLES = ("TOC", "TOC1", "TOC2", "TOC3", "TOC4", "TOC5", "TOC6")
+TOC_DEFAULT_MAX_LEVEL = 2
+
+
+def toc_max_level_from_ref(ref: str) -> int | None:
+    match = TOC_REF_RE.fullmatch(ref.strip())
+    if not match:
+        return None
+    level = match.group("level")
+    return int(level) if level else TOC_DEFAULT_MAX_LEVEL
 
 
 def _is_external_wiki_target(target: str) -> bool:
@@ -59,6 +71,19 @@ def _parse_timestamp(value: str) -> int | None:
             seconds = seconds * 60 + int(part)
         return seconds
     return None
+
+
+def _heading_text_from_html(rendered: str) -> str:
+    text = HTML_TAG_RE.sub("", rendered)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _heading_anchor_base(text: str) -> str:
+    lowered = text.strip().casefold()
+    slug = re.sub(r"[^\w\s\-가-힣]", "", lowered, flags=re.UNICODE)
+    slug = re.sub(r"[\s_]+", "-", slug, flags=re.UNICODE)
+    return slug.strip("-") or "section"
 
 
 def _youtube_height_from_width(width: int) -> int:
@@ -100,7 +125,7 @@ def extract_reference_targets(text: str) -> tuple[list[str], list[str]]:
 
     for match in TEMPLATE_RE.finditer(text):
         target = match.group(1).strip()
-        if target:
+        if target and toc_max_level_from_ref(target) is None:
             template_targets.append(target)
 
     return wiki_targets, template_targets
@@ -119,6 +144,21 @@ class WikiRenderContext:
 
 
 class PersonalWikiRenderer(mistune.HTMLRenderer):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._toc_headings: list[dict[str, object]] = []
+        self._heading_id_counts: dict[str, int] = {}
+        self._toc_placeholders: list[tuple[str, int]] = []
+
+    def heading(self, text: str, level: int, **attrs) -> str:
+        title = _heading_text_from_html(text)
+        requested_id = str(attrs.get("id") or "").strip()
+        anchor = requested_id or self._unique_heading_anchor(title)
+        if title:
+            self._toc_headings.append({"level": level, "title": title, "anchor": anchor})
+        safe_anchor = html.escape(anchor, quote=True)
+        return f'<h{level} id="{safe_anchor}">{text}</h{level}>\n'
+
     def table(self, text: str, column_widths: list[int] | None = None) -> str:
         colgroup = ""
         if column_widths:
@@ -161,6 +201,54 @@ class PersonalWikiRenderer(mistune.HTMLRenderer):
 
     def template_inline(self, text: str) -> str:
         return text
+
+    def toc(self, max_level: int) -> str:
+        placeholder = f"<!--PERSONALWIKI_TOC:{len(self._toc_placeholders)}-->"
+        self._toc_placeholders.append((placeholder, max_level))
+        return placeholder
+
+    def render_toc_placeholders(self, rendered: str) -> str:
+        for placeholder, max_level in self._toc_placeholders:
+            rendered = rendered.replace(placeholder, self._toc_html(max_level), 1)
+        return rendered
+
+    def _unique_heading_anchor(self, title: str) -> str:
+        base = _heading_anchor_base(title)
+        count = self._heading_id_counts.get(base, 0) + 1
+        self._heading_id_counts[base] = count
+        if count == 1:
+            return base
+        return f"{base}-{count}"
+
+    def _toc_html(self, max_level: int) -> str:
+        items = [
+            heading
+            for heading in self._toc_headings
+            if 1 <= int(heading["level"]) <= max_level
+        ]
+        if not items:
+            return (
+                '<nav class="wiki-toc wiki-toc-empty" aria-label="Table of contents">'
+                '<strong class="wiki-toc-title">Table of Contents</strong>'
+                "<p>표시할 heading이 없습니다.</p>"
+                "</nav>"
+            )
+
+        rendered_items = []
+        for heading in items:
+            level = int(heading["level"])
+            title = html.escape(str(heading["title"]))
+            anchor = html.escape(str(heading["anchor"]), quote=True)
+            rendered_items.append(
+                f'<li class="wiki-toc-level-{level}"><a href="#{anchor}">{title}</a></li>'
+            )
+        return (
+            '<nav class="wiki-toc" aria-label="Table of contents">'
+            '<strong class="wiki-toc-title">Table of Contents</strong>'
+            "<ol>"
+            + "".join(rendered_items)
+            + "</ol></nav>"
+        )
 
 
 def _get_context(env: MutableMapping[str, object]) -> WikiRenderContext:
@@ -342,6 +430,10 @@ def _parse_template_block(md: Markdown, block: mistune.BlockParser, match: Match
     ref = match.group("template_block_ref").strip()
     if not ref:
         return None
+    toc_max_level = toc_max_level_from_ref(ref)
+    if toc_max_level is not None:
+        state.append_token({"type": "toc", "attrs": {"max_level": toc_max_level}})
+        return state.find_line_end()
     rendered = _render_template_ref(md, state.env, ref)
     state.append_token({"type": "template_block", "raw": rendered})
     return state.find_line_end()
@@ -448,6 +540,10 @@ def _parse_template_inline(md: Markdown, inline: mistune.InlineParser, match: Ma
     ref = match.group("template_inline_ref").strip()
     if not ref:
         return None
+    toc_max_level = toc_max_level_from_ref(ref)
+    if toc_max_level is not None:
+        state.append_token({"type": "toc", "attrs": {"max_level": toc_max_level}})
+        return match.end()
     rendered = _render_template_ref(md, state.env, ref)
     state.append_token({"type": "template_inline", "raw": rendered})
     return match.end()
@@ -607,9 +703,12 @@ def personal_wiki_syntax(md: Markdown) -> None:
 
 class MarkdownEngine:
     def __init__(self) -> None:
-        self.markdown = mistune.create_markdown(
+        pass
+
+    def _create_markdown(self, renderer: PersonalWikiRenderer) -> Markdown:
+        return mistune.create_markdown(
             escape=False,
-            renderer=PersonalWikiRenderer(escape=False),
+            renderer=renderer,
             plugins=[
                 "strikethrough",
                 "table",
@@ -628,10 +727,12 @@ class MarkdownEngine:
         resolve_doc_reference: Callable[[str], str | None],
         read_document: Callable[[str], str | None],
     ) -> str:
-        state = self.markdown.block.state_cls()
+        renderer = PersonalWikiRenderer(escape=False)
+        markdown = self._create_markdown(renderer)
+        state = markdown.block.state_cls()
         state.env[WIKI_CONTEXT_KEY] = WikiRenderContext(
             resolve_doc_reference=resolve_doc_reference,
             read_document=read_document,
         )
-        rendered, _ = self.markdown.parse(text, state)
-        return str(rendered)
+        rendered, _ = markdown.parse(text, state)
+        return renderer.render_toc_placeholders(str(rendered))

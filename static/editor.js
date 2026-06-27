@@ -12,7 +12,8 @@
   const editForm = document.querySelector(".edit-form");
   const titleWarning = document.getElementById("title-link-warning");
   const currentSlug = editForm ? editForm.dataset.currentSlug || "" : "";
-  const unlinkableTitlePrefixes = ["file/", "http://", "https://"];
+  const unlinkableTitlePrefixes = ["img/", "file/", "http://", "https://"];
+  const unlinkableTitleNames = new Set(["toc", "toc1", "toc2", "toc3", "toc4", "toc5", "toc6"]);
 
   let previewTimer = null;
   let initialSnapshot = "";
@@ -57,7 +58,7 @@
 
   function hasUnlinkableTitlePrefix(rawTitle) {
     const value = String(rawTitle || "").trim().toLowerCase();
-    return unlinkableTitlePrefixes.some((prefix) => value.startsWith(prefix));
+    return unlinkableTitleNames.has(value) || unlinkableTitlePrefixes.some((prefix) => value.startsWith(prefix));
   }
 
   function syncTitleWarning() {

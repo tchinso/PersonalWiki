@@ -19,7 +19,7 @@
   {% if error %}
     <p class="error">{{ error }}</p>
   {% endif %}
-  {% set title_warning_text = title_warning or "이 문서는 위키 엔진 한계상 링크가 안 될 수 있습니다." %}
+  {% set title_warning_text = title_warning or "이 문서는 위키 엔진 한계상 링크 또는 템플릿 해석이 제대로 동작하지 않을 수 있습니다. 제목이 img/, file/, http://, https:// 로 시작하거나 TOC, TOC1~TOC6이면 내장 문법과 충돌할 수 있습니다." %}
   <p
     id="title-link-warning"
     class="danger-warning"
@@ -115,6 +115,12 @@
       </button>
       <button type="button" class="syntax-copy" data-copy="{% raw %}||{{접힌템플릿}}||{% endraw %}" title="클릭해서 복사">
         <span>접힌 템플릿</span><code>{% raw %}||{{접힌템플릿}}||{% endraw %}</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="{% raw %}{{TOC}}{% endraw %}" title="클릭해서 복사">
+        <span>목차</span><code>{% raw %}{{TOC}}{% endraw %}</code>
+      </button>
+      <button type="button" class="syntax-copy" data-copy="{% raw %}{{TOC3}}{% endraw %}" title="클릭해서 복사">
+        <span>목차 H3까지</span><code>{% raw %}{{TOC3}}{% endraw %}</code>
       </button>
       <button type="button" class="syntax-copy" data-copy="==강조==" title="클릭해서 복사">
         <span>하이라이트</span><code>==강조==</code>
