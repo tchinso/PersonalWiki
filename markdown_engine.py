@@ -27,6 +27,12 @@ WIKI_CONTEXT_KEY = "personal_wiki_context"
 TEMPLATE_DISABLED_KEY = "personal_wiki_template_disabled"
 TOC_RESERVED_TITLES = ("TOC", "TOC1", "TOC2", "TOC3", "TOC4", "TOC5", "TOC6")
 TOC_DEFAULT_MAX_LEVEL = 2
+CALLOUT_ICONS = {
+    "info": ("i", "정보"),
+    "note": ("💡", "노트"),
+    "warn": ("!", "경고"),
+    "danger": ("!", "위험"),
+}
 
 
 def toc_max_level_from_ref(ref: str) -> int | None:
@@ -172,7 +178,14 @@ class PersonalWikiRenderer(mistune.HTMLRenderer):
         return "<table>\n" + colgroup + text + "</table>\n"
 
     def callout(self, text: str, level: str) -> str:
-        return f'<div class="callout callout-{level}"><strong>{level.upper()}</strong> {text}</div>\n'
+        icon, label = CALLOUT_ICONS.get(level, ("i", level))
+        safe_label = html.escape(label, quote=True)
+        return (
+            f'<div class="callout callout-{level}">'
+            f'<span class="callout-icon" aria-label="{safe_label}" title="{safe_label}">{icon}</span>'
+            f'<span class="callout-content">{text}</span>'
+            "</div>\n"
+        )
 
     def template_block(self, text: str) -> str:
         return text

@@ -842,14 +842,57 @@ textarea {
 }
 
 .markdown-body .callout {
-  border-left: 5px solid var(--muted);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--muted);
+  border-left-width: 5px;
+  border-radius: var(--radius-md);
   padding: 12px 14px;
   margin: 12px 0;
 }
 
-.markdown-body .callout strong {
-  margin-right: 6px;
+.markdown-body .callout-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  margin-top: 1px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.markdown-body .callout-content {
+  min-width: 0;
+}
+
+.markdown-body .callout-note .callout-icon {
+  border: 0;
+  font-size: 20px;
+}
+
+.markdown-body .callout-warn .callout-icon {
+  border: 0;
+  border-radius: 0;
+  clip-path: polygon(50% 2px, 100% 24px, 0 24px);
+  color: #ffffff;
+  background: var(--warning);
+  font-size: 15px;
+  padding-top: 7px;
+}
+
+.markdown-body .callout-danger .callout-icon {
+  border: 0;
+  border-radius: 0;
+  clip-path: polygon(30% 0, 70% 0, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0 70%, 0 30%);
+  color: #ffffff;
+  background: var(--error);
+  font-size: 16px;
 }
 
 .markdown-body .callout-note {
@@ -858,8 +901,9 @@ textarea {
 }
 
 .markdown-body .callout-info {
-  border-color: var(--brand-lavender);
-  background: #f7f1ff;
+  border-color: #9ed828;
+  color: #3f5f00;
+  background: #f5ffe6;
 }
 
 .markdown-body .callout-warn {
