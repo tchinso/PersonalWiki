@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Match, MutableMapping
 from urllib.parse import quote
@@ -20,6 +21,10 @@ YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 EXTERNAL_WIKI_TARGET_RE = re.compile(r"^(https?|file)://", flags=re.IGNORECASE)
 FILE_WIKI_TARGET_RE = re.compile(r"^file/", flags=re.IGNORECASE)
 TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?(?P<dashes>-{3,}):?$")
+CALLOUT_LINE_RE = re.compile(
+    r"^[ \t]*!!![ \t]*(?P<callout_level>note|info|warn|danger)[ \t]+(?P<callout_body>[^\n]*)$",
+    flags=re.IGNORECASE,
+)
 TOC_REF_RE = re.compile(r"^TOC(?P<level>[1-6])?$", flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -100,21 +105,97 @@ def _youtube_width_from_height(height: int) -> int:
     return max(1, round(height * 16 / 9))
 
 
-def _table_column_widths(align: str, expected_columns: int) -> list[int] | None:
-    cells = mistune_table.CELL_SPLIT.split(align)
-    if len(cells) != expected_columns:
+def _table_separator_layout(cells: list[str]) -> tuple[list[int], list[str | None]] | None:
+    if not cells:
         return None
 
     widths: list[int] = []
+    aligns: list[str | None] = []
     for cell in cells:
-        match = TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
+        value = cell.strip()
+        match = TABLE_SEPARATOR_CELL_RE.fullmatch(value)
         if not match:
             return None
         widths.append(len(match.group("dashes")))
 
-    if all(width == 3 for width in widths):
-        return None
-    return widths
+        align_left = value.startswith(":")
+        align_right = value.endswith(":")
+        if align_left and align_right:
+            aligns.append("center")
+        elif align_left:
+            aligns.append("left")
+        elif align_right:
+            aligns.append("right")
+        else:
+            aligns.append(None)
+    return widths, aligns
+
+
+def _split_table_cells(text: str) -> list[str]:
+    return mistune_table.CELL_SPLIT.split(text)
+
+
+def _table_boundaries(widths: tuple[int, ...]) -> list[Fraction]:
+    total = sum(widths)
+    cursor = 0
+    boundaries = [Fraction(0, 1)]
+    for width in widths:
+        cursor += width
+        boundaries.append(Fraction(cursor, total))
+    return boundaries
+
+
+def _table_grid(
+    layouts: list[tuple[int, ...]],
+) -> tuple[list[float] | None, dict[tuple[int, ...], list[int]]]:
+    unique_layouts = list(dict.fromkeys(layouts))
+    if not unique_layouts:
+        return None, {}
+
+    if len(unique_layouts) == 1:
+        layout = unique_layouts[0]
+        column_widths = None if all(width == 3 for width in layout) else [float(width) for width in layout]
+        return column_widths, {layout: [1] * len(layout)}
+
+    boundary_set = {Fraction(0, 1), Fraction(1, 1)}
+    layout_boundaries: dict[tuple[int, ...], list[Fraction]] = {}
+    for layout in unique_layouts:
+        boundaries = _table_boundaries(layout)
+        layout_boundaries[layout] = boundaries
+        boundary_set.update(boundaries)
+
+    grid_boundaries = sorted(boundary_set)
+    boundary_indexes = {boundary: index for index, boundary in enumerate(grid_boundaries)}
+    column_widths = [
+        float(grid_boundaries[index + 1] - grid_boundaries[index])
+        for index in range(len(grid_boundaries) - 1)
+    ]
+
+    spans: dict[tuple[int, ...], list[int]] = {}
+    for layout, boundaries in layout_boundaries.items():
+        layout_spans: list[int] = []
+        for index in range(len(layout)):
+            start = boundary_indexes[boundaries[index]]
+            end = boundary_indexes[boundaries[index + 1]]
+            layout_spans.append(end - start)
+        spans[layout] = layout_spans
+    return column_widths, spans
+
+
+def _make_table_cells(
+    cells: list[str],
+    aligns: list[str | None],
+    spans: list[int],
+    *,
+    head: bool,
+) -> list[dict[str, object]]:
+    children: list[dict[str, object]] = []
+    for index, text in enumerate(cells):
+        attrs: dict[str, object] = {"align": aligns[index], "head": head}
+        if spans[index] > 1:
+            attrs["colspan"] = spans[index]
+        children.append({"type": "table_cell", "text": text.strip(), "attrs": attrs})
+    return children
 
 
 def extract_reference_targets(text: str) -> tuple[list[str], list[str]]:
@@ -165,7 +246,7 @@ class PersonalWikiRenderer(mistune.HTMLRenderer):
         safe_anchor = html.escape(anchor, quote=True)
         return f'<h{level} id="{safe_anchor}">{text}</h{level}>\n'
 
-    def table(self, text: str, column_widths: list[int] | None = None) -> str:
+    def table(self, text: str, column_widths: list[float] | None = None) -> str:
         colgroup = ""
         if column_widths:
             total = sum(column_widths)
@@ -176,6 +257,21 @@ class PersonalWikiRenderer(mistune.HTMLRenderer):
                 )
                 colgroup = f"<colgroup>\n{cols}</colgroup>\n"
         return "<table>\n" + colgroup + text + "</table>\n"
+
+    def table_cell(
+        self,
+        text: str,
+        align: str | None = None,
+        head: bool = False,
+        colspan: int | None = None,
+    ) -> str:
+        tag = "th" if head else "td"
+        attrs = ""
+        if align:
+            attrs += f' style="text-align:{align}"'
+        if colspan and colspan > 1:
+            attrs += f' colspan="{int(colspan)}"'
+        return f"  <{tag}{attrs}>{text}</{tag}>\n"
 
     def callout(self, text: str, level: str) -> str:
         icon, label = CALLOUT_ICONS.get(level, ("i", level))
@@ -430,11 +526,24 @@ def _parse_image_shortcut(raw: str) -> dict[str, object]:
     return {"type": "raw", "html": f'<img src="/img/{safe}" alt="{safe_alt}" loading="lazy"{attrs}>'}
 
 
-def _parse_callout(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int:
-    level = match.group("callout_level").lower()
-    body = html.escape(match.group("callout_body").strip())
-    state.append_token({"type": "callout", "raw": body, "attrs": {"level": level}})
-    return state.find_line_end()
+def _parse_callout(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
+    raw_lines = [line for line in match.group(0).splitlines() if line.strip()]
+    bodies: list[str] = []
+    level = ""
+    for line in raw_lines:
+        line_match = CALLOUT_LINE_RE.match(line)
+        if line_match is None:
+            return None
+        current_level = line_match.group("callout_level").lower()
+        if level and current_level != level:
+            return None
+        level = current_level
+        bodies.append(html.escape(line_match.group("callout_body").strip()))
+    if not level or not bodies:
+        return None
+
+    state.append_token({"type": "callout", "raw": "<br>\n".join(bodies), "attrs": {"level": level}})
+    return match.end()
 
 
 def _parse_template_block(md: Markdown, block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
@@ -581,27 +690,49 @@ def _parse_folded_template_inline(
 def _parse_table(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
     header = match.group("table_head")
     align = match.group("table_align")
-    thead, aligns = mistune_table._process_thead(header, align)
-    if not thead or aligns is None:
+    header_cells = _split_table_cells(header)
+    layout = _table_separator_layout(_split_table_cells(align))
+    if layout is None:
+        return None
+    active_widths, active_aligns = layout
+    if len(header_cells) != len(active_aligns):
         return None
 
-    column_widths = _table_column_widths(align, len(aligns))
-    if column_widths is None and any(
-        not TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
-        for cell in mistune_table.CELL_SPLIT.split(align)
-    ):
-        return None
-
-    rows = []
+    layouts = [tuple(active_widths)]
+    body_rows: list[tuple[list[str], list[str | None], tuple[int, ...]]] = []
     body = match.group("table_body")
     for text in body.splitlines():
         cell_match = mistune_table.TABLE_CELL.match(text)
         if not cell_match:
             return None
-        row = mistune_table._process_row(cell_match.group(1), aligns)
-        if not row:
+        cells = _split_table_cells(cell_match.group(1))
+        next_layout = _table_separator_layout(cells)
+        if next_layout is not None:
+            active_widths, active_aligns = next_layout
+            layouts.append(tuple(active_widths))
+            continue
+        if len(cells) != len(active_aligns):
             return None
-        rows.append(row)
+        body_rows.append((cells, list(active_aligns), tuple(active_widths)))
+
+    column_widths, layout_spans = _table_grid(layouts)
+    header_layout = tuple(layout[0])
+    thead = {
+        "type": "table_head",
+        "children": _make_table_cells(
+            header_cells,
+            layout[1],
+            layout_spans[header_layout],
+            head=True,
+        ),
+    }
+    rows = [
+        {
+            "type": "table_row",
+            "children": _make_table_cells(cells, aligns, layout_spans[widths], head=False),
+        }
+        for cells, aligns, widths in body_rows
+    ]
 
     token: dict[str, object] = {
         "type": "table",
@@ -616,24 +747,46 @@ def _parse_table(block: mistune.BlockParser, match: Match[str], state: BlockStat
 def _parse_nptable(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
     header = match.group("nptable_head")
     align = match.group("nptable_align")
-    thead, aligns = mistune_table._process_thead(header, align)
-    if not thead or aligns is None:
+    header_cells = _split_table_cells(header)
+    layout = _table_separator_layout(_split_table_cells(align))
+    if layout is None:
+        return None
+    active_widths, active_aligns = layout
+    if len(header_cells) != len(active_aligns):
         return None
 
-    column_widths = _table_column_widths(align, len(aligns))
-    if column_widths is None and any(
-        not TABLE_SEPARATOR_CELL_RE.fullmatch(cell.strip())
-        for cell in mistune_table.CELL_SPLIT.split(align)
-    ):
-        return None
-
-    rows = []
+    layouts = [tuple(active_widths)]
+    body_rows: list[tuple[list[str], list[str | None], tuple[int, ...]]] = []
     body = match.group("nptable_body")
     for text in body.splitlines():
-        row = mistune_table._process_row(text, aligns)
-        if not row:
+        cells = _split_table_cells(text)
+        next_layout = _table_separator_layout(cells)
+        if next_layout is not None:
+            active_widths, active_aligns = next_layout
+            layouts.append(tuple(active_widths))
+            continue
+        if len(cells) != len(active_aligns):
             return None
-        rows.append(row)
+        body_rows.append((cells, list(active_aligns), tuple(active_widths)))
+
+    column_widths, layout_spans = _table_grid(layouts)
+    header_layout = tuple(layout[0])
+    thead = {
+        "type": "table_head",
+        "children": _make_table_cells(
+            header_cells,
+            layout[1],
+            layout_spans[header_layout],
+            head=True,
+        ),
+    }
+    rows = [
+        {
+            "type": "table_row",
+            "children": _make_table_cells(cells, aligns, layout_spans[widths], head=False),
+        }
+        for cells, aligns, widths in body_rows
+    ]
 
     token: dict[str, object] = {
         "type": "table",
@@ -671,7 +824,10 @@ def personal_wiki_syntax(md: Markdown) -> None:
     )
     md.block.register(
         "callout",
-        r"^[ \t]*!!![ \t]*(?P<callout_level>note|info|warn|danger)[ \t]+(?P<callout_body>[^\n]*)",
+        (
+            r"^[ \t]*!!![ \t]*(?P<callout_level>note|info|warn|danger)[ \t]+[^\n]*"
+            r"(?:\n[ \t]*!!![ \t]*(?P=callout_level)[ \t]+[^\n]*)*(?:\n|$)"
+        ),
         _parse_callout,
         before="fenced_code",
     )

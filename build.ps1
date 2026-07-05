@@ -71,6 +71,22 @@ if ($hasRuntimeBackup) {
   }
 }
 
+$syntaxDocName = -join @([char]0xC704, [char]0xD0A4, "-", [char]0xBB38, [char]0xBC95, "-", [char]0xC124, [char]0xBA85, [char]0xC11C)
+$sourceDocDir = Join-Path (Get-Location) "doc"
+$sourceJsonDir = Join-Path $sourceDocDir "json"
+$sourceSyntaxDoc = Join-Path $sourceDocDir ($syntaxDocName + ".md")
+$sourceSyntaxJson = Join-Path $sourceJsonDir ($syntaxDocName + ".json")
+$distDocDir = Join-Path $distDir "doc"
+$distJsonDir = Join-Path $distDocDir "json"
+New-Item -ItemType Directory -Path $distDocDir -Force | Out-Null
+New-Item -ItemType Directory -Path $distJsonDir -Force | Out-Null
+if (Test-Path -LiteralPath $sourceSyntaxDoc) {
+  Copy-Item -LiteralPath $sourceSyntaxDoc -Destination (Join-Path $distDocDir ($syntaxDocName + ".md")) -Force
+}
+if (Test-Path -LiteralPath $sourceSyntaxJson) {
+  Copy-Item -LiteralPath $sourceSyntaxJson -Destination (Join-Path $distJsonDir ($syntaxDocName + ".json")) -Force
+}
+
 $resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $resolvedBackup = [System.IO.Path]::GetFullPath($runtimeBackup)
 if ($resolvedBackup.StartsWith($resolvedTemp, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedBackup)) {

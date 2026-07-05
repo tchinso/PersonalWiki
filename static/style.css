@@ -983,11 +983,11 @@ textarea {
 }
 
 .table-editor-grid col.table-narrow-control-column {
-  width: 32px;
+  width: 72px;
 }
 
 .table-editor-grid col.table-data-column {
-  width: 210px;
+  width: 230px;
 }
 
 .table-editor-grid th,
@@ -1003,7 +1003,7 @@ textarea {
 }
 
 .table-editor-grid td {
-  min-width: 180px;
+  min-width: 190px;
 }
 
 .table-editor-grid textarea {
@@ -1015,8 +1015,8 @@ textarea {
 }
 
 .table-editor-grid .table-control-spacer {
-  width: 32px;
-  min-width: 32px;
+  width: 72px;
+  min-width: 72px;
   background: var(--surface-soft);
 }
 
@@ -1028,12 +1028,68 @@ textarea {
 }
 
 .table-editor-grid tbody th {
-  padding: 2px;
+  padding: 4px;
 }
 
 .table-control-corner {
   color: var(--muted);
   font-size: 12px;
+}
+
+.table-column-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.table-row-control {
+  width: 72px;
+}
+
+.table-row-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.table-cell-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.table-width-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.table-width-input {
+  width: 52px;
+  min-height: 24px;
+  padding: 2px 4px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-xs);
+  background: var(--canvas);
+  color: var(--body-strong);
+}
+
+.table-empty-cell {
+  background: var(--surface-soft);
+}
+
+.table-row-action {
+  min-width: 72px;
+  text-align: center;
+  background: var(--surface-soft);
 }
 
 .table-delete-control,
