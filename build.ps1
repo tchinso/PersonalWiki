@@ -1,5 +1,22 @@
 $ErrorActionPreference = "Stop"
 
+$utf8NoBomEncoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
+
+function Convert-ToUtf8NoBomFile {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return
+  }
+
+  $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+  $text = [System.IO.File]::ReadAllText($resolvedPath)
+  [System.IO.File]::WriteAllText($resolvedPath, $text, $utf8NoBomEncoding)
+}
+
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pythonCommand) {
   $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
@@ -63,13 +80,17 @@ foreach ($directoryName in @("doc", "img", "file")) {
   New-Item -ItemType Directory -Path (Join-Path $distDir $directoryName) -Force | Out-Null
 }
 Copy-Item -Path "img\\*" -Destination (Join-Path $distDir "img") -Force
-Copy-Item -LiteralPath "wikisettings.cfg" -Destination (Join-Path $distDir "wikisettings.cfg") -Force
+Convert-ToUtf8NoBomFile -Path "wikisettings.cfg"
+$distSettingsPath = Join-Path $distDir "wikisettings.cfg"
+Copy-Item -LiteralPath "wikisettings.cfg" -Destination $distSettingsPath -Force
+Convert-ToUtf8NoBomFile -Path $distSettingsPath
 
 if ($hasRuntimeBackup) {
   Get-ChildItem -LiteralPath $runtimeBackup -Force | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $distDir -Recurse -Force
   }
 }
+Convert-ToUtf8NoBomFile -Path $distSettingsPath
 
 $syntaxDocName = -join @([char]0xC704, [char]0xD0A4, "-", [char]0xBB38, [char]0xBC95, "-", [char]0xC124, [char]0xBA85, [char]0xC11C)
 $sourceDocDir = Join-Path (Get-Location) "doc"

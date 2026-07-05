@@ -132,7 +132,51 @@ def _table_separator_layout(cells: list[str]) -> tuple[list[int], list[str | Non
 
 
 def _split_table_cells(text: str) -> list[str]:
-    return mistune_table.CELL_SPLIT.split(text)
+    cells: list[str] = []
+    start = 0
+    pos = 0
+    while pos < len(text):
+        if text[pos] == "|" and not _is_escaped_pipe(text, pos):
+            cells.append(text[start:pos].strip())
+            start = pos + 1
+        pos += 1
+    cells.append(text[start:].strip())
+    return cells
+
+
+def _is_escaped_pipe(text: str, pos: int) -> bool:
+    backslashes = 0
+    pos -= 1
+    while pos >= 0 and text[pos] == "\\":
+        backslashes += 1
+        pos -= 1
+    return backslashes % 2 == 1
+
+
+def _strip_pipe_table_row(line: str) -> str | None:
+    text = line.rstrip("\n").rstrip(" \t")
+    if not text.startswith("|") and text.startswith((" ", "\t")):
+        text = text.lstrip(" ")
+    if not text.startswith("|") or not text.endswith("|"):
+        return None
+    return text[1:-1]
+
+
+def _strip_table_line(line: str) -> str | None:
+    text = line.rstrip("\n").rstrip(" \t")
+    if not text or "|" not in text:
+        return None
+    return text
+
+
+def _parse_invalid_pipe_table(state: BlockState, pos: int) -> int:
+    while pos < state.cursor_max:
+        line = state.get_line(pos)
+        if _strip_pipe_table_row(line) is None:
+            break
+        pos += len(line)
+    state.add_paragraph(state.src[state.cursor : pos])
+    return pos
 
 
 def _table_boundaries(widths: tuple[int, ...]) -> list[Fraction]:
@@ -687,87 +731,58 @@ def _parse_folded_template_inline(
     return match.end()
 
 
-def _parse_table(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
-    header = match.group("table_head")
-    align = match.group("table_align")
+def _parse_custom_table(
+    match: Match[str],
+    state: BlockState,
+    *,
+    strip_row: Callable[[str], str | None],
+    invalid_pipe_table_as_paragraph: bool,
+) -> int | None:
+    pos = match.end()
+    header = strip_row(match.group(0))
+    if header is None:
+        return None
+
+    align_line = state.get_line(pos)
+    align = strip_row(align_line)
+    if align is None:
+        return None
+
     header_cells = _split_table_cells(header)
     layout = _table_separator_layout(_split_table_cells(align))
     if layout is None:
+        if invalid_pipe_table_as_paragraph:
+            return _parse_invalid_pipe_table(state, pos + len(align_line))
         return None
     active_widths, active_aligns = layout
     if len(header_cells) != len(active_aligns):
+        if invalid_pipe_table_as_paragraph:
+            return _parse_invalid_pipe_table(state, pos + len(align_line))
         return None
 
+    pos += len(align_line)
     layouts = [tuple(active_widths)]
     body_rows: list[tuple[list[str], list[str | None], tuple[int, ...]]] = []
-    body = match.group("table_body")
-    for text in body.splitlines():
-        cell_match = mistune_table.TABLE_CELL.match(text)
-        if not cell_match:
-            return None
-        cells = _split_table_cells(cell_match.group(1))
-        next_layout = _table_separator_layout(cells)
-        if next_layout is not None:
-            active_widths, active_aligns = next_layout
-            layouts.append(tuple(active_widths))
-            continue
-        if len(cells) != len(active_aligns):
-            return None
-        body_rows.append((cells, list(active_aligns), tuple(active_widths)))
 
-    column_widths, layout_spans = _table_grid(layouts)
-    header_layout = tuple(layout[0])
-    thead = {
-        "type": "table_head",
-        "children": _make_table_cells(
-            header_cells,
-            layout[1],
-            layout_spans[header_layout],
-            head=True,
-        ),
-    }
-    rows = [
-        {
-            "type": "table_row",
-            "children": _make_table_cells(cells, aligns, layout_spans[widths], head=False),
-        }
-        for cells, aligns, widths in body_rows
-    ]
+    while pos < state.cursor_max:
+        line = state.get_line(pos)
+        text = strip_row(line)
+        if text is None:
+            break
 
-    token: dict[str, object] = {
-        "type": "table",
-        "children": [thead, {"type": "table_body", "children": rows}],
-    }
-    if column_widths:
-        token["attrs"] = {"column_widths": column_widths}
-    state.append_token(token)
-    return match.end()
-
-
-def _parse_nptable(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
-    header = match.group("nptable_head")
-    align = match.group("nptable_align")
-    header_cells = _split_table_cells(header)
-    layout = _table_separator_layout(_split_table_cells(align))
-    if layout is None:
-        return None
-    active_widths, active_aligns = layout
-    if len(header_cells) != len(active_aligns):
-        return None
-
-    layouts = [tuple(active_widths)]
-    body_rows: list[tuple[list[str], list[str | None], tuple[int, ...]]] = []
-    body = match.group("nptable_body")
-    for text in body.splitlines():
         cells = _split_table_cells(text)
         next_layout = _table_separator_layout(cells)
         if next_layout is not None:
             active_widths, active_aligns = next_layout
             layouts.append(tuple(active_widths))
+            pos += len(line)
             continue
         if len(cells) != len(active_aligns):
+            if invalid_pipe_table_as_paragraph:
+                return _parse_invalid_pipe_table(state, pos + len(line))
             return None
         body_rows.append((cells, list(active_aligns), tuple(active_widths)))
+        pos += len(line)
 
     column_widths, layout_spans = _table_grid(layouts)
     header_layout = tuple(layout[0])
@@ -795,7 +810,25 @@ def _parse_nptable(block: mistune.BlockParser, match: Match[str], state: BlockSt
     if column_widths:
         token["attrs"] = {"column_widths": column_widths}
     state.append_token(token)
-    return match.end()
+    return pos
+
+
+def _parse_table(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
+    return _parse_custom_table(
+        match,
+        state,
+        strip_row=_strip_pipe_table_row,
+        invalid_pipe_table_as_paragraph=True,
+    )
+
+
+def _parse_nptable(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
+    return _parse_custom_table(
+        match,
+        state,
+        strip_row=_strip_table_line,
+        invalid_pipe_table_as_paragraph=False,
+    )
 
 
 def personal_wiki_table(md: Markdown) -> None:
