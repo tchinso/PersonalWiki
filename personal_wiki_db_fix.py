@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import unicodedata
 from contextlib import closing
@@ -46,6 +47,47 @@ def normalize_newlines(text: str) -> str:
 def read_text_normalized(path: Path) -> str:
     with path.open("r", encoding="utf-8", newline="") as file:
         return normalize_newlines(file.read())
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_name = file.name
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def cleanup_stale_temp_files() -> int:
+    removed = 0
+    for directory in (DOC_DIR, JSON_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.glob(".*.tmp"):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+            except OSError as error:
+                print(f"[WARN] failed to remove stale temp file {path}: {error}")
+    return removed
 
 
 def read_json_dict(path: Path) -> dict:
@@ -222,6 +264,7 @@ def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool)
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA temp_store = MEMORY")
     conn.execute("PRAGMA cache_size = -20000")
+    conn.execute("PRAGMA mmap_size = 268435456")
     if foreign_keys:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -280,7 +323,12 @@ def init_main_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docs_updated_title "
+        "ON docs (updated_at DESC, title COLLATE NOCASE)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_doc ON doc_tags (tag_id, doc_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
@@ -431,10 +479,9 @@ def write_sidecar(
         "references": normalize_reference_payload(references),
     }
     sidecar_path = JSON_DIR / f"{slug}.json"
-    sidecar_path.write_text(
+    write_text_atomic(
+        sidecar_path,
         json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-        newline="\n",
     )
 
 
@@ -591,6 +638,7 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
 def recreate_databases() -> tuple[int, int, int]:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_temp_files()
 
     temp_main = DATA_DIR / "wiki.rebuild.db"
     temp_fts = DATA_DIR / "wiki_fts.rebuild.db"

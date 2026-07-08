@@ -1,4 +1,7 @@
 /build
 /dist
 /__pycache__
-/tests
+/tests/__pycache__/
+wiki.db
+wiki_fts.db
+wiki_token.db

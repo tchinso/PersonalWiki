@@ -11,6 +11,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
 import unicodedata
 import zipfile
 from collections import defaultdict
@@ -78,6 +80,8 @@ DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 TEMPLATE_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
 _DATA_LOCK_FILE = None
+_WRITE_LOCK = threading.RLock()
+_WRITE_LOCK_ENDPOINTS = {"new_doc", "edit_doc", "delete_doc"}
 
 
 app = Flask(
@@ -93,6 +97,7 @@ DIRTY_MTIME_GRACE_SECONDS = 1.0
 SEVERE_DIFF_MIN_CHANGES = 50
 SEVERE_DIFF_RATIO = 0.9
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
+TAG_SEARCH_TERM_LIMIT = 20
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6885
 SETTINGS_PATH = DATA_DIR / "wikisettings.cfg"
@@ -207,6 +212,7 @@ def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool)
     conn.execute("PRAGMA wal_autocheckpoint = 1000")
     conn.execute("PRAGMA temp_store = MEMORY")
     conn.execute("PRAGMA cache_size = -20000")
+    conn.execute("PRAGMA mmap_size = 268435456")
     if foreign_keys:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -263,12 +269,41 @@ def close_db(_error: BaseException | None) -> None:
         token_conn.close()
 
 
+@app.before_request
+def acquire_write_lock_for_mutation() -> None:
+    if request.method == "POST" and request.endpoint in _WRITE_LOCK_ENDPOINTS:
+        _WRITE_LOCK.acquire()
+        g.write_lock_acquired = True
+
+
+@app.teardown_request
+def release_write_lock_for_mutation(_error: BaseException | None) -> None:
+    if g.pop("write_lock_acquired", False):
+        _WRITE_LOCK.release()
+
+
 def init_storage() -> None:
     DOC_DIR.mkdir(parents=True, exist_ok=True)
     JSON_DIR.mkdir(parents=True, exist_ok=True)
     IMG_DIR.mkdir(parents=True, exist_ok=True)
     FILE_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_temp_files()
     ensure_default_favicon()
+
+
+def cleanup_stale_temp_files() -> int:
+    removed = 0
+    for directory in (DOC_DIR, JSON_DIR):
+        if not directory.exists():
+            continue
+        for path in directory.glob(".*.tmp"):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+            except OSError as error:
+                print(f"[WARN] failed to remove stale temp file {path}: {error}")
+    return removed
 
 
 def ensure_default_favicon() -> None:
@@ -330,7 +365,12 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_docs_updated_title "
+            "ON docs (updated_at DESC, title COLLATE NOCASE)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_doc ON doc_tags (tag_id, doc_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
@@ -482,6 +522,32 @@ def read_text_normalized(path: Path) -> str:
         return normalize_newlines(file.read())
 
 
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_name = file.name
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def read_document(slug: str) -> str:
     path = document_path(slug)
     if not path.exists():
@@ -498,7 +564,7 @@ def read_document_if_exists(slug: str) -> str | None:
 
 def write_document(slug: str, content: str) -> None:
     normalized = normalize_newlines(content)
-    document_path(slug).write_text(normalized, encoding="utf-8", newline="\n")
+    write_text_atomic(document_path(slug), normalized)
 
 
 def move_document_assets_for_slug_change(old_slug: str, new_slug: str) -> list[tuple[Path, Path]]:
@@ -523,6 +589,30 @@ def rollback_document_asset_moves(moved: list[tuple[Path, Path]]) -> None:
                 new_path.rename(old_path)
         except OSError as error:
             print(f"[WARN] failed to rollback document asset move {new_path} -> {old_path}: {error}")
+
+
+def stage_document_assets_for_delete(slug: str) -> list[tuple[Path, Path]]:
+    staged: list[tuple[Path, Path]] = []
+    for old_path in (document_path(slug), sidecar_path(slug)):
+        if not old_path.exists():
+            continue
+        for index in range(100):
+            staged_path = old_path.with_name(f".{old_path.name}.delete-{os.getpid()}-{index}.tmp")
+            if not staged_path.exists():
+                break
+        else:
+            raise FileExistsError(f"could not allocate delete staging path for {old_path}")
+        old_path.rename(staged_path)
+        staged.append((old_path, staged_path))
+    return staged
+
+
+def finalize_staged_asset_deletes(staged: list[tuple[Path, Path]]) -> None:
+    for _old_path, staged_path in staged:
+        try:
+            staged_path.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"[WARN] failed to remove staged deleted asset {staged_path}: {error}")
 
 
 def load_sidecar(slug: str) -> dict:
@@ -614,10 +704,9 @@ def write_sidecar(
         "meta": meta,
         "references": normalized_references,
     }
-    sidecar_path(slug).write_text(
+    write_text_atomic(
+        sidecar_path(slug),
         json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-        newline="\n",
     )
 
 
@@ -632,21 +721,21 @@ def build_doc_tag_map(conn: sqlite3.Connection, doc_ids: list[int]) -> dict[int,
     if not unique_doc_ids:
         return {}
 
-    placeholders = ",".join("?" for _ in unique_doc_ids)
-    rows = conn.execute(
-        f"""
-        SELECT dt.doc_id, t.name
-        FROM doc_tags dt
-        JOIN tags t ON t.id = dt.tag_id
-        WHERE dt.doc_id IN ({placeholders})
-        ORDER BY dt.doc_id, t.name COLLATE NOCASE
-        """,
-        unique_doc_ids,
-    ).fetchall()
-
     mapping: dict[int, list[str]] = defaultdict(list)
-    for row in rows:
-        mapping[int(row["doc_id"])].append(str(row["name"]))
+    for chunk in iter_sqlite_chunks(unique_doc_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT dt.doc_id, t.name
+            FROM doc_tags dt
+            JOIN tags t ON t.id = dt.tag_id
+            WHERE dt.doc_id IN ({placeholders})
+            ORDER BY dt.doc_id, t.name COLLATE NOCASE
+            """,
+            chunk,
+        ).fetchall()
+        for row in rows:
+            mapping[int(row["doc_id"])].append(str(row["name"]))
     return dict(mapping)
 
 
@@ -894,7 +983,7 @@ def resolve_doc_reference(conn: sqlite3.Connection, ref: str) -> str | None:
     return None
 
 
-def iter_sqlite_chunks(values: list[str], size: int = SQLITE_IN_CLAUSE_CHUNK_SIZE):
+def iter_sqlite_chunks(values: list[object], size: int = SQLITE_IN_CLAUSE_CHUNK_SIZE):
     for index in range(0, len(values), size):
         yield values[index : index + size]
 
@@ -1084,14 +1173,20 @@ def _export_document_shell(
 def build_single_html_export(doc: dict, rendered_content: str) -> bytes:
     css = read_text_normalized(STATIC_DIR / "style.css")
     script = read_text_normalized(STATIC_DIR / "wiki.js")
+    embedded_images: dict[Path, str] = {}
 
     def embed_image(url: str) -> str:
         kind, source, _relative = _export_asset_path(url)
         if kind == "file":
             return url
+        cached = embedded_images.get(source)
+        if cached is not None:
+            return cached
         mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
         encoded = base64.b64encode(source.read_bytes()).decode("ascii")
-        return f"data:{mime};base64,{encoded}"
+        data_url = f"data:{mime};base64,{encoded}"
+        embedded_images[source] = data_url
+        return data_url
 
     rewritten = _rewrite_local_asset_urls(rendered_content, embed_image)
     html_text = _export_document_shell(
@@ -1145,9 +1240,11 @@ def normalize_search_query(query: str) -> str:
     return " ".join(query.split())
 
 
-def extract_tag_search_terms(query: str) -> list[str]:
+def extract_tag_search_terms(query: str, *, limit: int = TAG_SEARCH_TERM_LIMIT) -> list[str]:
     terms: list[str] = []
     seen: set[str] = set()
+    if limit <= 0:
+        return terms
     for raw in re.split(r"\s+", query):
         token = raw.strip().strip("\"'()")
         token = token.lstrip("#")
@@ -1160,6 +1257,8 @@ def extract_tag_search_terms(query: str) -> list[str]:
             continue
         seen.add(key)
         terms.append(token)
+        if len(terms) >= limit:
+            break
     return terms
 
 
@@ -1168,7 +1267,7 @@ def escape_sql_like(value: str) -> str:
 
 
 def search_docs_by_tags(conn: sqlite3.Connection, terms: list[str], *, limit: int = 200) -> list[dict]:
-    if not terms:
+    if not terms or limit <= 0:
         return []
 
     patterns = [f"%{escape_sql_like(term)}%" for term in terms if term]
@@ -2138,27 +2237,25 @@ def delete_doc(slug: str):
     if row is None:
         abort(404)
 
+    staged_assets: list[tuple[Path, Path]] = []
     try:
+        staged_assets = stage_document_assets_for_delete(slug)
         fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
         conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
         delete_language_doc_tokens(token_conn, conn, row["id"])
         mark_fts_index_current(conn, fts_conn)
-        conn.commit()
         fts_conn.commit()
         token_conn.commit()
+        conn.commit()
         invalidate_tag_recommendation_cache()
     except Exception:
         conn.rollback()
         fts_conn.rollback()
         token_conn.rollback()
+        rollback_document_asset_moves(staged_assets)
         raise
 
-    md = document_path(slug)
-    side = sidecar_path(slug)
-    if md.exists():
-        md.unlink()
-    if side.exists():
-        side.unlink()
+    finalize_staged_asset_deletes(staged_assets)
 
     return redirect(url_for("index"))
 
