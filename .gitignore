@@ -5,3 +5,4 @@
 wiki.db
 wiki_fts.db
 wiki_token.db
+/tests

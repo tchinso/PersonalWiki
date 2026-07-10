@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 TOKEN_DB_PATH = DATA_DIR / "wiki_token.db"
 DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 _DATA_LOCK_FILE = None
+DB_FIX_PARENT_LOCK_ENV = "PERSONALWIKI_DB_FIX_PARENT_LOCK_HELD"
 
 
 def iso_from_timestamp(timestamp: float) -> str:
@@ -286,9 +288,34 @@ def init_main_db(conn: sqlite3.Connection) -> None:
             file_path TEXT NOT NULL,
             meta_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            content_mtime_ns INTEGER NOT NULL DEFAULT 0,
+            content_size INTEGER NOT NULL DEFAULT -1
         )
         """
+    )
+    doc_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(docs)").fetchall()
+    }
+    if "content_mtime_ns" not in doc_columns:
+        conn.execute(
+            "ALTER TABLE docs ADD COLUMN content_mtime_ns INTEGER NOT NULL DEFAULT 0"
+        )
+    if "content_size" not in doc_columns:
+        conn.execute(
+            "ALTER TABLE docs ADD COLUMN content_size INTEGER NOT NULL DEFAULT -1"
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wiki_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO wiki_meta (key, value) VALUES ('corpus_revision', '0')"
     )
     conn.execute(
         """
@@ -322,16 +349,11 @@ def init_main_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_slug ON docs (slug)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_docs_updated_title "
         "ON docs (updated_at DESC, title COLLATE NOCASE)"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_id ON doc_tags (tag_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_tags_tag_doc ON doc_tags (tag_id, doc_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_title_key ON doc_references (target_title_key)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_key ON doc_references (target_slug_key)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_refs_source ON doc_references (source_doc_id)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_doc_refs_title_lookup "
         "ON doc_references (target_title_key, source_doc_id, ref_type)"
@@ -340,6 +362,14 @@ def init_main_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_doc_refs_slug_lookup "
         "ON doc_references (target_slug_key, source_doc_id, ref_type)"
     )
+    for index_name in (
+        "idx_docs_slug",
+        "idx_doc_tags_tag_id",
+        "idx_doc_refs_title_key",
+        "idx_doc_refs_slug_key",
+        "idx_doc_refs_source",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
     # Legacy cleanup: older versions stored docs_fts in wiki.db.
     conn.execute("DROP TABLE IF EXISTS docs_fts")
 
@@ -527,8 +557,10 @@ def restore_sqlite_backups(moved: list[tuple[Path, Path]]) -> None:
 
 
 def replace_databases_from_temp(temp_main: Path, temp_fts: Path, temp_token: Path) -> Path:
-    backup_dir = DATA_DIR / "db_backups" / time.strftime("%Y%m%d-%H%M%S")
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_root = DATA_DIR / "db_backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_dir = backup_root / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex}"
+    backup_dir.mkdir(exist_ok=False)
     moved: list[tuple[Path, Path]] = []
     replaced: list[Path] = []
 
@@ -570,17 +602,22 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
         init_fts_db(fts_conn)
         ensure_language_token_tables(token_conn)
 
-        for md_file in sorted(DOC_DIR.glob("*.md")):
+        connections = (main_conn, fts_conn, token_conn)
+        for index, md_file in enumerate(sorted(DOC_DIR.glob("*.md"))):
             slug = md_file.stem
             sidecar = read_json_dict(JSON_DIR / f"{slug}.json")
+            savepoint = f"document_{index}"
+            for conn in connections:
+                conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 content = read_text_normalized(md_file)
+                file_stat = md_file.stat()
 
                 sidecar_title = str(sidecar.get("title", "")).strip()
                 title_candidate = sidecar_title or infer_title_from_content(content, slug) or slug
                 title = ensure_unique_title(main_conn, title_candidate)
 
-                updated_at = iso_from_timestamp(md_file.stat().st_mtime)
+                updated_at = iso_from_timestamp(file_stat.st_mtime)
                 created_at_raw = str(sidecar.get("created_at") or "").strip()
                 created_at = created_at_raw or updated_at
 
@@ -590,8 +627,9 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
 
                 main_conn.execute(
                     """
-                    INSERT INTO docs (title, slug, file_path, meta_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO docs
+                    (title, slug, file_path, meta_json, created_at, updated_at, content_mtime_ns, content_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         title,
@@ -600,6 +638,8 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
                         json.dumps(meta, ensure_ascii=False),
                         created_at,
                         updated_at,
+                        int(file_stat.st_mtime_ns),
+                        int(file_stat.st_size),
                     ),
                 )
                 row = main_conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()
@@ -622,11 +662,24 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
                     meta=meta,
                     references=references,
                 )
+                for conn in connections:
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 imported += 1
             except Exception as error:
+                for conn in reversed(connections):
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 skipped += 1
                 print(f"[WARN] skipped {md_file.name}: {error}")
 
+        main_conn.execute(
+            "UPDATE wiki_meta SET value = ? WHERE key = 'corpus_revision'",
+            (str(imported),),
+        )
+        main_conn.execute(
+            "INSERT INTO wiki_meta (key, value) VALUES ('file_state_v1', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+        )
         _token_docs, token_terms = rebuild_language_token_index(token_conn, main_conn, fts_conn)
         mark_fts_index_current(main_conn, fts_conn)
         main_conn.commit()
@@ -667,12 +720,15 @@ def main() -> int:
     print(f"FTS DB: {FTS_DB_PATH}")
     print(f"Token DB: {TOKEN_DB_PATH}")
 
+    owns_data_lock = os.environ.get(DB_FIX_PARENT_LOCK_ENV) != "1"
     try:
-        acquire_data_lock()
+        if owns_data_lock:
+            acquire_data_lock()
         try:
             imported, skipped, token_terms = recreate_databases()
         finally:
-            release_data_lock()
+            if owns_data_lock:
+                release_data_lock()
     except Exception as error:
         print(f"[ERROR] failed to rebuild databases: {error}")
         return 1
