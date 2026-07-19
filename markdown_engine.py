@@ -14,6 +14,7 @@ from mistune.util import escape_url
 
 WIKI_LINK_RE = re.compile(r"(?<!\!)\[\[([^\[\]]+)\]\]")
 IMAGE_SHORTCUT_RE = re.compile(r"!\[\[([^\[\]]+)\]\]")
+TAG_EMBED_RE = re.compile(r"^tag\((?P<tag>.*)\)$", flags=re.IGNORECASE)
 TEMPLATE_RE = re.compile(r"\{\{([^{}]+)\}\}")
 FOLDED_TEMPLATE_RE = re.compile(r"\|\|\s*\{\{([^{}]+)\}\}\s*\|\|?")
 YOUTUBE_RE = re.compile(r"^youtube\((.*)\)$", flags=re.IGNORECASE)
@@ -268,9 +269,11 @@ class WikiRenderContext:
         *,
         resolve_doc_reference: Callable[[str], str | None],
         read_document: Callable[[str], str | None],
+        list_tag_documents: Callable[[str], list[dict[str, object]]],
     ) -> None:
         self.resolve_doc_reference = resolve_doc_reference
         self.read_document = read_document
+        self.list_tag_documents = list_tag_documents
         self.template_cache: dict[str, str] = {}
 
 
@@ -521,6 +524,27 @@ def _render_youtube(raw: str) -> str | None:
     )
 
 
+def _tag_name_from_embed(raw: str) -> str | None:
+    match = TAG_EMBED_RE.fullmatch(raw.strip())
+    if match is None:
+        return None
+    tag_name = match.group("tag").strip()
+    return tag_name or None
+
+
+def _render_tag_embed(raw: str, context: WikiRenderContext) -> str | None:
+    tag_name = _tag_name_from_embed(raw)
+    if tag_name is None:
+        return None
+
+    links = []
+    for document in context.list_tag_documents(tag_name):
+        title = html.escape(str(document["title"]))
+        slug = quote(str(document["slug"]))
+        links.append(f'<a href="/doc/{slug}">{title}</a>')
+    return '<span class="tag-document-list">' + " ・ ".join(links) + "</span>"
+
+
 def _parse_image_shortcut(raw: str) -> dict[str, object]:
     youtube = _render_youtube(raw)
     if youtube is not None:
@@ -623,6 +647,10 @@ def _parse_folded_template_block(
 
 def _parse_raw_image_block(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
     raw = match.group("raw_image_block_value").strip()
+    tag_embed = _render_tag_embed(raw, _get_context(state.env))
+    if tag_embed is not None:
+        state.append_token({"type": "raw_embed", "raw": tag_embed})
+        return state.find_line_end()
     parsed = _parse_image_shortcut(raw)
     if parsed["type"] != "raw":
         return None
@@ -686,6 +714,10 @@ def _parse_wiki_link(inline: mistune.InlineParser, match: Match[str], state: Inl
 
 def _parse_image_shortcut_inline(inline: mistune.InlineParser, match: Match[str], state: InlineState) -> int:
     raw = match.group("image_shortcut_value").strip()
+    tag_embed = _render_tag_embed(raw, _get_context(state.env))
+    if tag_embed is not None:
+        state.append_token({"type": "raw_embed", "raw": tag_embed})
+        return match.end()
     parsed = _parse_image_shortcut(raw)
     if parsed["type"] == "image":
         state.append_token(
@@ -928,6 +960,7 @@ class MarkdownEngine:
         *,
         resolve_doc_reference: Callable[[str], str | None],
         read_document: Callable[[str], str | None],
+        list_tag_documents: Callable[[str], list[dict[str, object]]],
     ) -> str:
         renderer = PersonalWikiRenderer(escape=False)
         markdown = self._create_markdown(renderer)
@@ -935,6 +968,7 @@ class MarkdownEngine:
         state.env[WIKI_CONTEXT_KEY] = WikiRenderContext(
             resolve_doc_reference=resolve_doc_reference,
             read_document=read_document,
+            list_tag_documents=list_tag_documents,
         )
         rendered, _ = markdown.parse(text, state)
         return renderer.render_toc_placeholders(str(rendered))

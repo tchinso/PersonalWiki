@@ -70,6 +70,7 @@ ENGLISH_STOPWORDS = {
     "https",
     "br",
     "youtube",
+    "tag",
     "width",
     "height",
     "info",
@@ -217,7 +218,7 @@ MARKDOWN_EMBED_IGNORE_SPAN_RE = re.compile(
     r"!\[\[[^\]\r\n]*\]\]|!\[[^\]\r\n]*\]\([^\r\n)]*\)"
 )
 
-TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v3-ignore-markdown-embeds"
+TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v4-ignore-markdown-embeds-and-tag"
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25

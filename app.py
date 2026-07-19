@@ -944,6 +944,21 @@ def list_doc_tags(conn: sqlite3.Connection, doc_id: int) -> list[str]:
     return build_doc_tag_map(conn, [doc_id]).get(doc_id, [])
 
 
+def fetch_docs_by_tag(conn: sqlite3.Connection, tag_name: str) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT d.id, d.title, d.slug, d.updated_at
+        FROM docs d
+        JOIN doc_tags dt ON dt.doc_id = d.id
+        JOIN tags t ON t.id = dt.tag_id
+        WHERE t.name = ? COLLATE NOCASE
+        ORDER BY d.updated_at DESC, d.title COLLATE NOCASE
+        """,
+        (tag_name,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def parse_tags(raw: str) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -1252,6 +1267,7 @@ def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
         text,
         resolve_doc_reference=resolve_cached,
         read_document=read_document_if_exists,
+        list_tag_documents=lambda tag_name: fetch_docs_by_tag(conn, tag_name),
     )
     return Markup(html)
 
@@ -2627,19 +2643,7 @@ def delete_doc(slug: str):
 
 @app.route("/tag/<path:tag_name>")
 def docs_by_tag(tag_name: str):
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT d.id, d.title, d.slug, d.updated_at
-        FROM docs d
-        JOIN doc_tags dt ON dt.doc_id = d.id
-        JOIN tags t ON t.id = dt.tag_id
-        WHERE t.name = ? COLLATE NOCASE
-        ORDER BY d.updated_at DESC, d.title COLLATE NOCASE
-        """,
-        (tag_name,),
-    ).fetchall()
-    docs = [dict(row) for row in rows]
+    docs = fetch_docs_by_tag(get_db(), tag_name)
     return render_template("tag.html", tag_name=tag_name, docs=docs)
 
 
