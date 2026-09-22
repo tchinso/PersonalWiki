@@ -14,6 +14,7 @@ internal static class Program
             var fixturePath = Path.Combine(AppContext.BaseDirectory, "native-renderer-fixture.json");
             using var fixture = JsonDocument.Parse(File.ReadAllText(fixturePath));
             var payload = DocumentPayload.FromJson(fixture.RootElement);
+            RunNullableNumberSmokeTest();
             RunAttachmentStoreSmokeTest();
             RunWebpDecodeSmokeTest();
             RunImageLoadConcurrencySmokeTest();
@@ -121,6 +122,13 @@ internal static class Program
             Console.Error.WriteLine(error);
             return 1;
         }
+    }
+
+    private static void RunNullableNumberSmokeTest()
+    {
+        using var terminalPage = JsonDocument.Parse("{\"next_offset\":null}");
+        Assert(JsonValue.Int(terminalPage.RootElement, "next_offset") is null,
+            "terminal pagination accepts a null next_offset");
     }
 
     private static void RunAttachmentStoreSmokeTest()

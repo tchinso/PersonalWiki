@@ -266,7 +266,9 @@ internal static class JsonValue
     {
         foreach (var name in names)
         {
-            if (element.TryGetProperty(name, out var value) && value.TryGetInt32(out var parsed))
+            if (element.TryGetProperty(name, out var value)
+                && value.ValueKind == JsonValueKind.Number
+                && value.TryGetInt32(out var parsed))
             {
                 return parsed;
             }
