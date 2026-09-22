@@ -4,6 +4,7 @@ import json
 import atexit
 import base64
 import io
+from ipaddress import ip_address
 import mimetypes
 import os
 import re
@@ -17,6 +18,7 @@ import unicodedata
 import zipfile
 from collections import defaultdict
 from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
@@ -38,6 +40,7 @@ from markupsafe import Markup
 from markdown_engine import MarkdownEngine, TOC_RESERVED_TITLES, extract_reference_targets
 from language_tools import (
     TAG_RECOMMEND_LIMIT,
+    TAG_RECOMMEND_MAX_CONTENT_ANALYSIS_CHARS,
     apply_korean_spell_autofix,
     build_language_index_source_signature,
     collect_korean_spell_issues,
@@ -81,7 +84,14 @@ TEMPLATE_DIR = RESOURCE_DIR / "templates"
 STATIC_DIR = RESOURCE_DIR / "static"
 _DATA_LOCK_FILE = None
 _WRITE_LOCK = threading.RLock()
-_WRITE_LOCK_ENDPOINTS = {"new_doc", "edit_doc", "delete_doc"}
+_WRITE_LOCK_ENDPOINTS = {
+    "new_doc",
+    "edit_doc",
+    "delete_doc",
+    "client_create_document",
+    "client_update_document",
+    "client_delete_document",
+}
 
 
 app = Flask(
@@ -97,14 +107,97 @@ SEVERE_DIFF_MIN_CHANGES = 50
 SEVERE_DIFF_RATIO = 0.9
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
 TAG_SEARCH_TERM_LIMIT = 20
+# Tag suggestion requests can originate from the browser/tunnel endpoint as
+# well as from the localhost native client.  Keep that read-only computation
+# bounded without imposing a size limit on normal document save operations.
+TAG_SUGGESTION_MAX_TITLE_CHARS = 8_192
+TAG_SUGGESTION_MAX_CONTENT_CHARS = TAG_RECOMMEND_MAX_CONTENT_ANALYSIS_CHARS
+TAG_SUGGESTION_MAX_TAGS = 100
+TAG_SUGGESTION_MAX_TAG_CHARS = 256
+TAG_SUGGESTION_MAX_SLUG_CHARS = 512
+TAG_SUGGESTION_MAX_TAG_TEXT_CHARS = TAG_SUGGESTION_MAX_TAGS * (
+    TAG_SUGGESTION_MAX_TAG_CHARS + 1
+)
+# JSON emitters may escape non-ASCII characters as six-byte ``\\uXXXX``
+# sequences.  This pre-JSON-decode ceiling therefore covers the permitted
+# fields even in that worst case while rejecting oversized/chunked bodies
+# before Flask materializes them.
+TAG_SUGGESTION_MAX_REQUEST_BYTES = (
+    6
+    * (
+        TAG_SUGGESTION_MAX_TITLE_CHARS
+        + TAG_SUGGESTION_MAX_CONTENT_CHARS
+        + TAG_SUGGESTION_MAX_TAG_TEXT_CHARS
+        + TAG_SUGGESTION_MAX_SLUG_CHARS
+    )
+    + 65_536
+)
+# The markdown and sidecar files are the canonical document data.  The main
+# database still owns user-facing titles/tags/references, so keep its commits
+# fully durable.  FTS and token databases are derived from those files and
+# are deliberately allowed to trade a little durability for lower write cost:
+# startup signatures rebuild either index after an interrupted write.
+SQLITE_MAIN_SYNCHRONOUS = "FULL"
+SQLITE_DERIVED_SYNCHRONOUS = "NORMAL"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6885
 SETTINGS_PATH = DATA_DIR / "wikisettings.cfg"
+CLIENT_API_PREFIX = "/api/client/"
+CLIENT_API_VERSION = 1
+# A tunnel proxy normally connects to Flask from 127.0.0.1 and adds one of
+# these headers.  The native-client API must never ride that browser/tunnel
+# path; direct PersonalWikiClient requests do not send proxy headers.
+CLIENT_API_PROXY_HEADERS = (
+    "Forwarded",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Real-IP",
+)
+DEFAULT_BROWSER_FONT_KEY = "system"
+BROWSER_FONT_OPTIONS = (
+    {
+        "key": "system",
+        "label": "시스템 기본 글꼴",
+        "css": 'Inter, "Noto Sans KR", "Segoe UI", Roboto, sans-serif',
+    },
+    {
+        "key": "pretendard",
+        "label": "Pretendard",
+        "css": 'Pretendard, "Noto Sans KR", "Segoe UI", sans-serif',
+    },
+    {
+        "key": "noto-sans-kr",
+        "label": "Noto Sans KR",
+        "css": '"Noto Sans KR", "Segoe UI", Arial, sans-serif',
+    },
+    {
+        "key": "malgun-gothic",
+        "label": "맑은 고딕",
+        "css": '"Malgun Gothic", "맑은 고딕", "Segoe UI", sans-serif',
+    },
+    {
+        "key": "nanum-gothic",
+        "label": "나눔고딕",
+        "css": '"Nanum Gothic", "나눔고딕", "Malgun Gothic", sans-serif',
+    },
+    {
+        "key": "serif",
+        "label": "명조 계열",
+        "css": '"Noto Serif KR", "Batang", "바탕", Georgia, serif',
+    },
+)
+BROWSER_FONT_OPTIONS_BY_KEY = {option["key"]: option for option in BROWSER_FONT_OPTIONS}
+_SETTINGS_LOCK = threading.RLock()
 LOCAL_ASSET_URL_RE = re.compile(
     r"(?P<prefix>\b(?:src|href)\s*=\s*)(?P<quote>['\"])(?P<url>/(?:img|file)/[^'\"?#]*)(?P=quote)",
     flags=re.IGNORECASE,
 )
 FILE_REFERENCE_RE = re.compile(r"\[\[\s*file/", flags=re.IGNORECASE)
+STAGED_DOCUMENT_ASSET_RE = re.compile(
+    r"^\.[^.].*\.(?:edit|delete)-\d+-\d+\.(?:tmp|stage)$",
+    flags=re.IGNORECASE,
+)
 UNLINKABLE_TITLE_PREFIXES = ("img/", "http://", "https://", "file/")
 UNLINKABLE_TITLE_NAMES = tuple(title.casefold() for title in TOC_RESERVED_TITLES)
 TITLE_LINK_LIMIT_WARNING = (
@@ -112,7 +205,6 @@ TITLE_LINK_LIMIT_WARNING = (
     "제목이 img/, file/, http://, https:// 로 시작하거나 TOC, TOC1~TOC6이면 내장 문법과 충돌할 수 있습니다."
 )
 SIDECAR_SYNC_STATE_VERSION = "1"
-DB_FIX_PARENT_LOCK_ENV = "PERSONALWIKI_DB_FIX_PARENT_LOCK_HELD"
 MISSING_DOC_MARKER_PREFIX = "missing_doc/"
 
 
@@ -124,24 +216,178 @@ class ExportError(ValueError):
     pass
 
 
-def read_server_port(settings_path: Path = SETTINGS_PATH) -> int:
-    """Read port=<number> from wikisettings.cfg, falling back safely."""
-    try:
-        raw = settings_path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError):
-        return DEFAULT_PORT
+class NativeAstUnavailable(RuntimeError):
+    pass
 
+
+class NativeAstFormatError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class WikiSettings:
+    """User-editable server and browser settings stored beside the data files."""
+
+    port: int = DEFAULT_PORT
+    browser_font: str = DEFAULT_BROWSER_FONT_KEY
+
+
+def _resolve_settings_path(settings_path: Path | None) -> Path:
+    return SETTINGS_PATH if settings_path is None else settings_path
+
+
+def _parse_server_port(value: str) -> int | None:
+    value = value.strip()
+    if not value.isascii() or not value.isdigit():
+        return None
+    port = int(value)
+    return port if 1 <= port <= 65535 else None
+
+
+def _normalize_custom_font_name(value: str) -> str | None:
+    """Accept one installed font family name, never arbitrary CSS syntax."""
+    name = " ".join(value.split())
+    if not name or len(name) > 80:
+        return None
+    if not all(character.isalnum() or character in " _-." for character in name):
+        return None
+    return name
+
+
+def normalize_browser_font_setting(value: str) -> str | None:
+    """Return a known font key or a safe ``custom:<family>`` setting."""
+    raw = value.strip()
+    key = raw.casefold()
+    if key in BROWSER_FONT_OPTIONS_BY_KEY:
+        return key
+
+    if key.startswith("custom:"):
+        raw = raw.split(":", 1)[1]
+    custom_name = _normalize_custom_font_name(raw)
+    return f"custom:{custom_name}" if custom_name is not None else None
+
+
+def browser_font_css(browser_font: str) -> str:
+    """Build a CSS font-family value from a setting already validated above."""
+    option = BROWSER_FONT_OPTIONS_BY_KEY.get(browser_font)
+    if option is not None:
+        return str(option["css"])
+
+    if browser_font.startswith("custom:"):
+        custom_name = _normalize_custom_font_name(browser_font.split(":", 1)[1])
+        if custom_name is not None:
+            fallback = str(BROWSER_FONT_OPTIONS_BY_KEY[DEFAULT_BROWSER_FONT_KEY]["css"])
+            return f'"{custom_name}", {fallback}'
+
+    return str(BROWSER_FONT_OPTIONS_BY_KEY[DEFAULT_BROWSER_FONT_KEY]["css"])
+
+
+def browser_font_form_value(browser_font: str) -> str:
+    return browser_font if browser_font in BROWSER_FONT_OPTIONS_BY_KEY else "custom"
+
+
+def browser_font_custom_name(browser_font: str) -> str:
+    if not browser_font.startswith("custom:"):
+        return ""
+    return browser_font.split(":", 1)[1]
+
+
+def parse_browser_font_form(selected_value: str, custom_value: str) -> str | None:
+    selected_key = selected_value.strip().casefold()
+    if selected_key == "custom":
+        custom_name = _normalize_custom_font_name(custom_value)
+        return f"custom:{custom_name}" if custom_name is not None else None
+    return selected_key if selected_key in BROWSER_FONT_OPTIONS_BY_KEY else None
+
+
+def read_wiki_settings(settings_path: Path | None = None) -> WikiSettings:
+    """Read known ``wikisettings.cfg`` keys while ignoring malformed values."""
+    path = _resolve_settings_path(settings_path)
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return WikiSettings()
+
+    port = DEFAULT_PORT
+    browser_font = DEFAULT_BROWSER_FONT_KEY
+    found_port = False
+    found_browser_font = False
     for raw_line in raw.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(("#", ";")) or "=" not in line:
             continue
         key, value = (part.strip() for part in line.split("=", 1))
-        if key.casefold() != "port" or not value.isascii() or not value.isdigit():
-            continue
-        port = int(value)
-        if 1 <= port <= 65535:
-            return port
-    return DEFAULT_PORT
+        key = key.casefold()
+        if key == "port" and not found_port:
+            parsed_port = _parse_server_port(value)
+            if parsed_port is not None:
+                port = parsed_port
+                found_port = True
+        elif key == "browser_font" and not found_browser_font:
+            parsed_font = normalize_browser_font_setting(value)
+            if parsed_font is not None:
+                browser_font = parsed_font
+                found_browser_font = True
+
+    return WikiSettings(port=port, browser_font=browser_font)
+
+
+def read_server_port(settings_path: Path | None = None) -> int:
+    """Read port=<number> from wikisettings.cfg, falling back safely."""
+    return read_wiki_settings(settings_path).port
+
+
+def _replace_wiki_settings_values(raw: str, settings: WikiSettings) -> str:
+    desired_values = {
+        "port": str(settings.port),
+        "browser_font": settings.browser_font,
+    }
+    replaced_keys: set[str] = set()
+    result_lines: list[str] = []
+
+    for raw_line in normalize_newlines(raw).splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith(("#", ";")) and "=" in line:
+            raw_key, _raw_value = (part.strip() for part in line.split("=", 1))
+            key = raw_key.casefold()
+            if key in desired_values:
+                if key not in replaced_keys:
+                    result_lines.append(f"{key}={desired_values[key]}")
+                    replaced_keys.add(key)
+                continue
+        result_lines.append(raw_line)
+
+    for key in ("port", "browser_font"):
+        if key not in replaced_keys:
+            if result_lines and result_lines[-1]:
+                result_lines.append("")
+            result_lines.append(f"{key}={desired_values[key]}")
+
+    return "\n".join(result_lines).rstrip("\n") + "\n"
+
+
+def write_wiki_settings(settings: WikiSettings, settings_path: Path | None = None) -> None:
+    """Atomically update known keys without discarding comments or unknown keys."""
+    port = _parse_server_port(str(settings.port))
+    browser_font = normalize_browser_font_setting(settings.browser_font)
+    if port is None or browser_font is None:
+        raise ValueError("Invalid wiki settings")
+
+    path = _resolve_settings_path(settings_path)
+    normalized_settings = WikiSettings(port=port, browser_font=browser_font)
+    with _SETTINGS_LOCK:
+        try:
+            raw_with_bom = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw_with_bom = ""
+        except UnicodeError as error:
+            raise OSError("설정 파일을 UTF-8로 읽을 수 없습니다.") from error
+        has_utf8_bom = raw_with_bom.startswith("\ufeff")
+        raw = raw_with_bom.removeprefix("\ufeff")
+        content = _replace_wiki_settings_values(raw, normalized_settings)
+        if has_utf8_bom:
+            content = "\ufeff" + content
+        write_text_atomic(path, content)
 
 
 def _lock_file_handle(handle) -> None:
@@ -207,12 +453,25 @@ def release_data_lock() -> None:
     handle.close()
 
 
-def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool) -> None:
+def configure_sqlite_connection(
+    conn: sqlite3.Connection,
+    *,
+    foreign_keys: bool,
+    synchronous: str,
+) -> None:
     """Apply per-connection settings only.
 
     Journal mode is database state, not connection state.  Re-applying WAL for
     every request caused avoidable lock negotiation on all three databases.
+    ``synchronous`` is connection-local as well, so make the main/derived
+    durability policy explicit instead of relying on SQLite's default.
     """
+    if synchronous == SQLITE_MAIN_SYNCHRONOUS:
+        conn.execute("PRAGMA synchronous = FULL")
+    elif synchronous == SQLITE_DERIVED_SYNCHRONOUS:
+        conn.execute("PRAGMA synchronous = NORMAL")
+    else:
+        raise ValueError(f"Unsupported SQLite synchronous mode: {synchronous}")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA temp_store = MEMORY")
     conn.execute("PRAGMA cache_size = -4000")
@@ -222,30 +481,46 @@ def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool)
 
 
 def configure_sqlite_storage(conn: sqlite3.Connection) -> None:
-    """Apply persistent SQLite settings while initializing a database file."""
+    """Apply database-file settings while initializing a SQLite file.
+
+    ``synchronous`` is intentionally absent here: SQLite keeps it per
+    connection, and ``configure_sqlite_connection`` owns the durable-main /
+    recoverable-index policy for every subsequent connection.
+    """
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA wal_autocheckpoint = 1000")
 
 
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    configure_sqlite_connection(conn, foreign_keys=True)
+    configure_sqlite_connection(
+        conn,
+        foreign_keys=True,
+        synchronous=SQLITE_MAIN_SYNCHRONOUS,
+    )
     return conn
 
 
 def connect_fts_db() -> sqlite3.Connection:
     conn = sqlite3.connect(FTS_DB_PATH)
     conn.row_factory = sqlite3.Row
-    configure_sqlite_connection(conn, foreign_keys=False)
+    configure_sqlite_connection(
+        conn,
+        foreign_keys=False,
+        synchronous=SQLITE_DERIVED_SYNCHRONOUS,
+    )
     return conn
 
 
 def connect_token_db() -> sqlite3.Connection:
     conn = sqlite3.connect(TOKEN_DB_PATH)
     conn.row_factory = sqlite3.Row
-    configure_sqlite_connection(conn, foreign_keys=False)
+    configure_sqlite_connection(
+        conn,
+        foreign_keys=False,
+        synchronous=SQLITE_DERIVED_SYNCHRONOUS,
+    )
     return conn
 
 
@@ -282,9 +557,39 @@ def close_db(_error: BaseException | None) -> None:
 
 @app.before_request
 def acquire_write_lock_for_mutation() -> None:
-    if request.method == "POST" and request.endpoint in _WRITE_LOCK_ENDPOINTS:
+    if request.method in {"POST", "PUT", "DELETE"} and request.endpoint in _WRITE_LOCK_ENDPOINTS:
         _WRITE_LOCK.acquire()
         g.write_lock_acquired = True
+
+
+def is_loopback_request() -> bool:
+    """Accept only direct loopback traffic, never a tunneled proxy request."""
+    # ngrok and similar reverse proxies reach the local Flask listener from
+    # loopback.  Their forwarding headers are the only signal available on a
+    # shared listener, so reject those requests rather than accidentally
+    # publishing the localhost-only mutation API through a tunnel.
+    if any(request.headers.get(header) for header in CLIENT_API_PROXY_HEADERS):
+        return False
+    remote_addr = request.remote_addr
+    if not remote_addr:
+        return False
+    try:
+        return ip_address(remote_addr).is_loopback
+    except ValueError:
+        return False
+
+
+@app.before_request
+def restrict_client_api_to_loopback() -> tuple[object, int] | None:
+    if request.path.startswith(CLIENT_API_PREFIX) and not is_loopback_request():
+        return jsonify(
+            {
+                "error": "PersonalWikiClient API는 localhost 요청만 허용합니다.",
+                "error_code": "localhost_only",
+                "message": "PersonalWikiClient API는 localhost 요청만 허용합니다.",
+            }
+        ), 403
+    return None
 
 
 @app.teardown_request
@@ -308,6 +613,12 @@ def cleanup_stale_temp_files() -> int:
         if not directory.exists():
             continue
         for path in directory.glob(".*.tmp"):
+            # Prior releases used a .tmp suffix for edit/delete staging.  It
+            # can be the only remaining copy after an I/O failure, so never
+            # treat a recognized staged document as an atomic-write leftover.
+            if STAGED_DOCUMENT_ASSET_RE.fullmatch(path.name):
+                print(f"[WARN] preserving staged document asset for recovery: {path}")
+                continue
             try:
                 if path.is_file():
                     path.unlink()
@@ -773,7 +1084,7 @@ def stage_document_assets(slug: str, *, operation: str) -> list[tuple[Path, Path
                 continue
             for index in range(100):
                 staged_path = old_path.with_name(
-                    f".{old_path.name}.{operation}-{os.getpid()}-{index}.tmp"
+                    f".{old_path.name}.{operation}-{os.getpid()}-{index}.stage"
                 )
                 if not staged_path.exists():
                     break
@@ -1096,6 +1407,330 @@ def render_edit_form(**context):
     return render_template("edit.html", **context)
 
 
+@dataclass
+class DocumentSubmissionValidation:
+    title: str
+    content: str
+    tags: list[str]
+    title_warning: str | None
+    error: str | None = None
+    error_code: str | None = None
+    tag_warning: str | None = None
+    spell_warning: str | None = None
+    spellcheck_samples: list[dict[str, str]] = field(default_factory=list)
+
+
+def validate_document_submission(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    content: str,
+    tags: list[str],
+    is_new: bool,
+    current_doc_id: int | None = None,
+    ignore_tag_warning: bool = False,
+    spellcheck_action: str = "",
+) -> DocumentSubmissionValidation:
+    """Keep browser and local-client document validation behavior identical."""
+    normalized_title = title.strip()
+    normalized_content = normalize_newlines(content)
+    normalized_tags = parse_tags(",".join(str(tag) for tag in tags))
+    if spellcheck_action == "auto_fix":
+        normalized_title, normalized_content = apply_korean_spell_autofix(
+            normalized_title,
+            normalized_content,
+        )
+
+    title_warning = title_prefix_warning(normalized_title)
+    if not normalized_title:
+        return DocumentSubmissionValidation(
+            title=normalized_title,
+            content=normalized_content,
+            tags=normalized_tags,
+            title_warning=title_warning,
+            error="문서 제목을 입력해 주세요.",
+            error_code="title_required",
+        )
+
+    if current_doc_id is None:
+        duplicate = conn.execute(
+            "SELECT 1 FROM docs WHERE title = ? COLLATE NOCASE",
+            (normalized_title,),
+        ).fetchone()
+    else:
+        duplicate = conn.execute(
+            "SELECT id FROM docs WHERE title = ? COLLATE NOCASE AND id != ?",
+            (normalized_title, current_doc_id),
+        ).fetchone()
+    if duplicate:
+        return DocumentSubmissionValidation(
+            title=normalized_title,
+            content=normalized_content,
+            tags=normalized_tags,
+            title_warning=title_warning,
+            error="같은 제목의 문서가 이미 있습니다.",
+            error_code="duplicate_title",
+        )
+
+    if is_new and len(normalized_tags) < 2 and not ignore_tag_warning:
+        return DocumentSubmissionValidation(
+            title=normalized_title,
+            content=normalized_content,
+            tags=normalized_tags,
+            title_warning=title_warning,
+            tag_warning="태그를 2개 이상 등록하면 나중에 검색이 더 쉬워집니다. 계속 생성하려면 아래 버튼을 눌러 주세요.",
+        )
+
+    if spellcheck_action not in {"auto_fix", "save_as_is"}:
+        spell_issues = collect_korean_spell_issues(normalized_title, normalized_content)
+        if spell_issues:
+            raw_samples = spell_issues.get("samples", [])
+            samples = [dict(sample) for sample in raw_samples if isinstance(sample, dict)]
+            return DocumentSubmissionValidation(
+                title=normalized_title,
+                content=normalized_content,
+                tags=normalized_tags,
+                title_warning=title_warning,
+                spell_warning=korean_spell_warning_message(spell_issues.get("count", 0)),
+                spellcheck_samples=samples,
+            )
+
+    return DocumentSubmissionValidation(
+        title=normalized_title,
+        content=normalized_content,
+        tags=normalized_tags,
+        title_warning=title_warning,
+    )
+
+
+def document_tag_suggestions(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    *,
+    title: str,
+    content: str,
+    tags: list[str],
+    current_slug: str | None = None,
+) -> list[str]:
+    return recommend_tags(
+        conn,
+        fts_conn,
+        token_conn,
+        title=title,
+        content=content,
+        current_slug=current_slug,
+        exclude_tags=tags,
+        limit=TAG_RECOMMEND_LIMIT,
+    )
+
+
+def create_document_record(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    *,
+    title: str,
+    content: str,
+    tags: list[str],
+) -> dict:
+    """Persist a new document and all derived indexes as one shared workflow."""
+    slug = ensure_unique_slug(conn, slugify(title))
+    created_at = now_iso()
+    meta = {"sidecar": f"json/{slug}.json"}
+    created_assets: list[Path] = []
+    main_committed = False
+    try:
+        ensure_document_asset_targets_available(slug)
+        references = extract_reference_payload(content)
+        write_document(slug, content)
+        created_assets.append(document_path(slug))
+        content_mtime_ns, content_size = document_file_state(document_path(slug))
+        write_sidecar(
+            slug=slug,
+            title=title,
+            created_at=created_at,
+            updated_at=created_at,
+            tags=tags,
+            meta=meta,
+            references=references,
+        )
+        created_assets.append(sidecar_path(slug))
+        conn.execute(
+            """
+            INSERT INTO docs
+            (title, slug, file_path, meta_json, created_at, updated_at, content_mtime_ns, content_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                slug,
+                str(document_path(slug)),
+                json.dumps(meta, ensure_ascii=False),
+                created_at,
+                created_at,
+                content_mtime_ns,
+                content_size,
+            ),
+        )
+        doc_id = int(conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"])
+
+        set_doc_tags(conn, doc_id, tags)
+        set_doc_references(conn, doc_id, references)
+        bump_corpus_revision(conn)
+        update_fts(fts_conn, doc_id, title, content)
+        upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
+        mark_fts_index_current(conn, fts_conn)
+        mark_sidecar_sync_state(conn)
+        conn.commit()
+        main_committed = True
+        fts_conn.commit()
+        token_conn.commit()
+        invalidate_tag_recommendation_cache()
+    except Exception:
+        if main_committed:
+            invalidate_tag_recommendation_cache()
+        else:
+            conn.rollback()
+            discard_document_assets(created_assets)
+        fts_conn.rollback()
+        token_conn.rollback()
+        raise
+
+    saved = fetch_doc_with_tags(conn, slug)
+    if saved is None:
+        raise RuntimeError("created document could not be loaded")
+    return saved
+
+
+def update_document_record(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+    title: str,
+    content: str,
+    tags: list[str],
+) -> dict:
+    """Persist an edit with the same staging and index guarantees as browser edits."""
+    new_slug = ensure_unique_slug(conn, slugify(title), exclude_doc_id=int(row["id"]))
+    old_slug = str(row["slug"])
+    updated_at = now_iso()
+    meta = safe_load_json(str(row["meta_json"]))
+    meta["sidecar"] = f"json/{new_slug}.json"
+    staged_assets: list[tuple[Path, Path]] = []
+    created_assets: list[Path] = []
+    main_committed = False
+    try:
+        if new_slug != old_slug:
+            ensure_document_asset_targets_available(new_slug)
+        staged_assets = stage_document_assets(old_slug, operation="edit")
+        references = extract_reference_payload(content)
+        write_document(new_slug, content)
+        created_assets.append(document_path(new_slug))
+        content_mtime_ns, content_size = document_file_state(document_path(new_slug))
+        write_sidecar(
+            slug=new_slug,
+            title=title,
+            created_at=str(row["created_at"]),
+            updated_at=updated_at,
+            tags=tags,
+            meta=meta,
+            references=references,
+        )
+        created_assets.append(sidecar_path(new_slug))
+        conn.execute(
+            """
+            UPDATE docs
+            SET title = ?, slug = ?, file_path = ?, meta_json = ?, updated_at = ?,
+                content_mtime_ns = ?, content_size = ?
+            WHERE id = ?
+            """,
+            (
+                title,
+                new_slug,
+                str(document_path(new_slug)),
+                json.dumps(meta, ensure_ascii=False),
+                updated_at,
+                content_mtime_ns,
+                content_size,
+                row["id"],
+            ),
+        )
+        set_doc_tags(conn, int(row["id"]), tags)
+        set_doc_references(conn, int(row["id"]), references)
+        bump_corpus_revision(conn)
+        update_fts(fts_conn, int(row["id"]), title, content)
+        upsert_language_doc_tokens(token_conn, conn, int(row["id"]), title, content)
+        mark_fts_index_current(conn, fts_conn)
+        mark_sidecar_sync_state(conn)
+        conn.commit()
+        main_committed = True
+        fts_conn.commit()
+        token_conn.commit()
+        finalize_staged_document_assets(staged_assets)
+        invalidate_tag_recommendation_cache()
+    except Exception:
+        if main_committed:
+            finalize_staged_document_assets(staged_assets)
+            invalidate_tag_recommendation_cache()
+        else:
+            conn.rollback()
+            discard_document_assets(created_assets)
+            restore_staged_document_assets(staged_assets)
+        fts_conn.rollback()
+        token_conn.rollback()
+        raise
+
+    saved = fetch_doc_with_tags(conn, new_slug)
+    if saved is None:
+        raise RuntimeError("updated document could not be loaded")
+    return saved
+
+
+def delete_document_record(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+) -> None:
+    """Delete a document without leaving sidecars or secondary indexes stale."""
+    staged_assets: list[tuple[Path, Path]] = []
+    main_committed = False
+    try:
+        staged_assets = stage_document_assets(str(row["slug"]), operation="delete")
+        fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
+        conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
+        bump_corpus_revision(conn)
+        delete_language_doc_tokens(token_conn, conn, int(row["id"]))
+        mark_fts_index_current(conn, fts_conn)
+        conn.commit()
+        main_committed = True
+        fts_conn.commit()
+        token_conn.commit()
+        finalize_staged_document_assets(staged_assets)
+        mark_sidecar_sync_state(conn)
+        conn.commit()
+        invalidate_tag_recommendation_cache()
+    except Exception:
+        if main_committed:
+            # The primary row is already durable, but a secondary-index commit
+            # can still fail independently.  Keep the staged markdown and
+            # sidecar as recoverable source data instead of discarding them
+            # with a 500 response.  The next startup imports the file again
+            # and rebuilds the signature-mismatched derived indexes.
+            restore_staged_document_assets(staged_assets)
+            invalidate_tag_recommendation_cache()
+        else:
+            conn.rollback()
+            restore_staged_document_assets(staged_assets)
+        fts_conn.rollback()
+        token_conn.rollback()
+        raise
+
+
 def set_doc_tags(conn: sqlite3.Connection, doc_id: int, tags: list[str]) -> None:
     old_tag_rows = conn.execute(
         "SELECT tag_id FROM doc_tags WHERE doc_id = ?",
@@ -1253,7 +1888,7 @@ def bulk_resolve_doc_references(conn: sqlite3.Connection, refs: list[str]) -> di
     return resolved
 
 
-def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
+def _markdown_render_callbacks(conn: sqlite3.Connection, text: str) -> dict[str, object]:
     wiki_refs, template_refs = extract_reference_targets(text)
     reference_cache = bulk_resolve_doc_references(conn, [*wiki_refs, *template_refs])
 
@@ -1263,13 +1898,34 @@ def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
             reference_cache[key] = resolve_doc_reference(conn, ref)
         return reference_cache[key]
 
-    html = markdown_engine.render(
-        text,
-        resolve_doc_reference=resolve_cached,
-        read_document=read_document_if_exists,
-        list_tag_documents=lambda tag_name: fetch_docs_by_tag(conn, tag_name),
-    )
+    return {
+        "resolve_doc_reference": resolve_cached,
+        "read_document": read_document_if_exists,
+        "list_tag_documents": lambda tag_name: fetch_docs_by_tag(conn, tag_name),
+    }
+
+
+def render_markdown(conn: sqlite3.Connection, text: str) -> Markup:
+    html = markdown_engine.render(text, **_markdown_render_callbacks(conn, text))
     return Markup(html)
+
+
+def native_ast_renderer_available() -> bool:
+    return callable(getattr(markdown_engine, "render_ast", None))
+
+
+def render_native_ast(conn: sqlite3.Connection, text: str) -> list[object]:
+    """Render the same PersonalWiki context as HTML, but as native AST data."""
+    render_ast = getattr(markdown_engine, "render_ast", None)
+    if not callable(render_ast):
+        raise NativeAstUnavailable("Native markdown AST renderer is unavailable.")
+
+    rendered = render_ast(text, **_markdown_render_callbacks(conn, text))
+    if isinstance(rendered, dict):
+        rendered = rendered.get("ast")
+    if not isinstance(rendered, list):
+        raise NativeAstFormatError("Native markdown AST renderer returned an invalid payload.")
+    return rendered
 
 
 def parse_export_doc_address(raw_address: str) -> str:
@@ -1543,6 +2199,7 @@ def search_docs_by_tags(conn: sqlite3.Connection, query: str, *, limit: int = 20
             d.id AS doc_id,
             d.title,
             d.slug,
+            d.created_at,
             d.updated_at,
             {matched_tags_sql}
         FROM docs d
@@ -1561,6 +2218,8 @@ def search_docs_by_tags(conn: sqlite3.Connection, query: str, *, limit: int = 20
                 "doc_id": int(row["doc_id"]),
                 "title": str(row["title"]),
                 "slug": str(row["slug"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
                 "matched_tags": matched_tags,
             }
         )
@@ -1829,6 +2488,48 @@ def sync_deleted_doc(
         mark_fts_index_current(conn, fts_conn)
 
 
+def find_fts_id_mismatches(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+) -> tuple[list[int], list[int]]:
+    """Merge-scan sorted IDs without materializing either complete index.
+
+    Equal row counts do not prove FTS is aligned: one missing row plus one
+    orphan produces the same count.  The separate SQLite files cannot use a
+    SQL anti-join, so stream their ordered IDs in O(1) working memory instead.
+    """
+    docs_cursor = conn.execute("SELECT id FROM docs ORDER BY id")
+    fts_cursor = fts_conn.execute("SELECT rowid AS doc_id FROM docs_fts ORDER BY rowid")
+    doc_row = docs_cursor.fetchone()
+    fts_row = fts_cursor.fetchone()
+    missing_ids: list[int] = []
+    orphan_ids: list[int] = []
+
+    while doc_row is not None or fts_row is not None:
+        if doc_row is None:
+            orphan_ids.append(int(fts_row["doc_id"]))
+            fts_row = fts_cursor.fetchone()
+            continue
+        if fts_row is None:
+            missing_ids.append(int(doc_row["id"]))
+            doc_row = docs_cursor.fetchone()
+            continue
+
+        doc_id = int(doc_row["id"])
+        fts_doc_id = int(fts_row["doc_id"])
+        if doc_id == fts_doc_id:
+            doc_row = docs_cursor.fetchone()
+            fts_row = fts_cursor.fetchone()
+        elif doc_id < fts_doc_id:
+            missing_ids.append(doc_id)
+            doc_row = docs_cursor.fetchone()
+        else:
+            orphan_ids.append(fts_doc_id)
+            fts_row = fts_cursor.fetchone()
+
+    return missing_ids, orphan_ids
+
+
 def repair_fts_mismatch(
     conn: sqlite3.Connection,
     fts_conn: sqlite3.Connection,
@@ -1839,26 +2540,27 @@ def repair_fts_mismatch(
     if force_rebuild:
         return 0, 0, rebuild_fts_index_from_docs(conn, fts_conn)
 
-    doc_count_row = conn.execute("SELECT COUNT(*) AS c FROM docs").fetchone()
-    fts_count_row = fts_conn.execute("SELECT COUNT(*) AS c FROM docs_fts").fetchone()
-    doc_count = int(doc_count_row["c"]) if doc_count_row is not None else 0
-    fts_count = int(fts_count_row["c"]) if fts_count_row is not None else 0
-    if doc_count == fts_count:
+    missing_ids, orphan_ids = find_fts_id_mismatches(conn, fts_conn)
+    if not missing_ids and not orphan_ids:
         mark_fts_index_current(conn, fts_conn)
         return 0, 0, 0
 
-    doc_rows = conn.execute("SELECT id, title, slug FROM docs").fetchall()
-    fts_rows = fts_conn.execute("SELECT rowid FROM docs_fts").fetchall()
-
-    docs_by_id = {int(row["id"]): row for row in doc_rows}
-    doc_ids = set(docs_by_id.keys())
-    fts_ids = {int(row["rowid"]) for row in fts_rows}
-
-    missing_ids = sorted(doc_ids - fts_ids)
-    orphan_ids = sorted(fts_ids - doc_ids)
+    docs_by_id: dict[int, sqlite3.Row] = {}
+    for chunk in iter_sqlite_chunks(missing_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT id, title, slug FROM docs WHERE id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        docs_by_id.update({int(row["id"]): row for row in rows})
 
     for doc_id in missing_ids:
-        row = docs_by_id[doc_id]
+        row = docs_by_id.get(doc_id)
+        if row is None:
+            # A concurrent mutation cannot happen under the process write lock,
+            # but skipping a vanished row keeps repair safe if a caller uses
+            # this helper outside that normal request path.
+            continue
         content = read_document_if_exists(str(row["slug"])) or ""
         update_fts(fts_conn, doc_id, str(row["title"]), content)
         upsert_language_doc_tokens(
@@ -1880,13 +2582,14 @@ def repair_fts_mismatch(
 
 
 def rebuild_fts_index_from_docs(conn: sqlite3.Connection, fts_conn: sqlite3.Connection) -> int:
-    rows = conn.execute("SELECT id, title, slug FROM docs ORDER BY id").fetchall()
     fts_conn.execute("DELETE FROM docs_fts")
-    for row in rows:
+    rebuilt_count = 0
+    for row in conn.execute("SELECT id, title, slug FROM docs ORDER BY id"):
         content = read_document_if_exists(str(row["slug"])) or ""
         update_fts(fts_conn, int(row["id"]), str(row["title"]), content)
+        rebuilt_count += 1
     mark_fts_index_current(conn, fts_conn)
-    return len(rows)
+    return rebuilt_count
 
 
 def sync_documents_incremental() -> dict[str, int]:
@@ -2069,6 +2772,11 @@ def resolve_db_fix_command() -> list[str] | None:
     return None
 
 
+def database_swap_recovery_pending() -> bool:
+    """Let DBFix roll back a crash-interrupted multi-file database swap first."""
+    return (DATA_DIR / "wiki.db-swap-recovery.json").exists()
+
+
 def run_db_fix_tool(reason: str) -> bool:
     command = resolve_db_fix_command()
     if command is None:
@@ -2076,19 +2784,32 @@ def run_db_fix_tool(reason: str) -> bool:
         return False
 
     print(f"[WARN] Running PersonalWikiDBFix due to startup issue: {reason}")
+    # DBFix must own wiki.lock itself while it swaps the database families.
+    # Keeping a parent-held lock and asking the child to skip it left a race if
+    # this process died during recovery: the OS released our lock while the
+    # child could still replace files.  Releasing first means a competing
+    # server can only make DBFix fail before its swap, never mutate alongside it.
+    release_data_lock()
+    completed: subprocess.CompletedProcess[str] | None = None
+    lock_reacquired = False
     try:
-        environment = dict(os.environ)
-        environment[DB_FIX_PARENT_LOCK_ENV] = "1"
         completed = subprocess.run(
             command,
             cwd=str(DATA_DIR),
             check=False,
             capture_output=True,
             text=True,
-            env=environment,
         )
     except OSError as error:
         print(f"[ERROR] Failed to launch PersonalWikiDBFix: {error}")
+    finally:
+        try:
+            acquire_data_lock()
+            lock_reacquired = True
+        except RuntimeError as error:
+            print(f"[ERROR] Failed to re-acquire PersonalWiki data lock: {error}")
+
+    if not lock_reacquired or completed is None:
         return False
 
     if completed.stdout:
@@ -2111,9 +2832,8 @@ def sync_documents_on_startup() -> None:
     except sqlite3.DatabaseError as error:
         reason = f"database error: {error}"
 
-    # Keep the parent-held data lock while the child rebuilds.  The child is
-    # explicitly told to skip re-acquiring it, closing the race where another
-    # application instance could start between release and recovery.
+    # DBFix takes wiki.lock itself before rebuilding.  If another instance wins
+    # the short handoff, recovery fails safely before any database replacement.
     db_fix_ok = run_db_fix_tool(reason)
 
     if not db_fix_ok:
@@ -2203,15 +2923,35 @@ def fetch_doc_with_tags(conn: sqlite3.Connection, slug: str) -> dict | None:
     return data
 
 
-def fetch_docs_for_index(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT id, title, slug, created_at, updated_at
-        FROM docs
-        ORDER BY updated_at DESC, title COLLATE NOCASE
-        LIMIT 100
-        """
-    ).fetchall()
+def fetch_docs_for_index(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """Return document summaries with tags, ordered for both UI and client API."""
+    safe_offset = max(int(offset), 0)
+    if limit is None:
+        rows = conn.execute(
+            """
+            SELECT id, title, slug, created_at, updated_at
+            FROM docs
+            ORDER BY updated_at DESC, title COLLATE NOCASE
+            LIMIT -1 OFFSET ?
+            """,
+            (safe_offset,),
+        ).fetchall()
+    else:
+        safe_limit = min(max(int(limit), 1), 1000)
+        rows = conn.execute(
+            """
+            SELECT id, title, slug, created_at, updated_at
+            FROM docs
+            ORDER BY updated_at DESC, title COLLATE NOCASE
+            LIMIT ? OFFSET ?
+            """,
+            (safe_limit, safe_offset),
+        ).fetchall()
     tag_map = build_doc_tag_map(conn, [int(row["id"]) for row in rows])
     docs: list[dict] = []
     for row in rows:
@@ -2219,6 +2959,447 @@ def fetch_docs_for_index(conn: sqlite3.Connection) -> list[dict]:
         item["tags"] = tag_map.get(int(row["id"]), [])
         docs.append(item)
     return docs
+
+
+def client_document_summary(doc: dict[str, object]) -> dict[str, object]:
+    """Serialize only client-safe, stable document fields.
+
+    In particular, this deliberately excludes SQLite ids, absolute file paths,
+    and the raw sidecar JSON string.  PersonalWikiClient must stay an HTTP-only
+    consumer of PersonalWiki rather than learning the server's on-disk layout.
+    """
+    return {
+        "title": str(doc.get("title", "")),
+        "slug": str(doc.get("slug", "")),
+        "tags": [str(tag) for tag in doc.get("tags", []) if isinstance(tag, str)],
+        "created_at": client_optional_text(doc.get("created_at")),
+        "updated_at": client_optional_text(doc.get("updated_at")),
+    }
+
+
+def client_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
+
+
+def client_document_payload(conn: sqlite3.Connection, doc: dict[str, object], content: str) -> dict[str, object]:
+    """Serialize a full document without exposing direct-storage details."""
+    payload = client_document_summary(doc)
+    payload["content"] = content
+    meta = doc.get("meta")
+    if isinstance(meta, dict):
+        # Sidecar metadata is user-visible document metadata.  Copy it so a
+        # request handler can never mutate the in-memory database record.
+        payload["meta"] = dict(meta)
+    else:
+        payload["meta"] = {}
+    references = build_doc_reference_map(conn, [int(doc["id"])]).get(
+        int(doc["id"]),
+        {"links": [], "templates": []},
+    )
+    payload["references"] = {
+        "links": [str(value) for value in references.get("links", [])],
+        "templates": [str(value) for value in references.get("templates", [])],
+    }
+    return payload
+
+
+def client_backlink_summaries(backlinks: list[dict]) -> list[dict[str, object]]:
+    """Return the public subset of backlink rows."""
+    return [
+        {
+            "title": str(backlink.get("title", "")),
+            "slug": str(backlink.get("slug", "")),
+            "updated_at": client_optional_text(backlink.get("updated_at")),
+            "reasons": [str(reason) for reason in backlink.get("reasons", [])],
+        }
+        for backlink in backlinks
+    ]
+
+
+def list_client_tags(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT t.name, COUNT(dt.doc_id) AS document_count
+        FROM tags t
+        LEFT JOIN doc_tags dt ON dt.tag_id = t.id
+        GROUP BY t.id, t.name
+        ORDER BY t.name COLLATE NOCASE
+        """
+    ).fetchall()
+    return [
+        {
+            "name": str(row["name"]),
+            "document_count": int(row["document_count"]),
+        }
+        for row in rows
+    ]
+
+
+def search_documents(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 200,
+) -> tuple[list[dict[str, object]], str | None]:
+    """Use the browser's combined FTS and tag search behavior for API calls."""
+    normalized_query = query.strip()
+    if not normalized_query:
+        return [], None
+
+    safe_limit = min(max(int(limit), 1), 1000)
+    merged_by_doc_id: dict[int, dict[str, object]] = {}
+    ordered_doc_ids: list[int] = []
+    normalized = normalize_search_query(normalized_query)
+    error: str | None = None
+
+    try:
+        fts_rows = fts_conn.execute(
+            """
+            SELECT
+                rowid AS doc_id,
+                snippet(docs_fts, 1, '<mark>', '</mark>', ' ... ', 24) AS excerpt
+            FROM docs_fts
+            WHERE docs_fts MATCH ?
+            ORDER BY bm25(docs_fts)
+            LIMIT ?
+            """,
+            (normalized, safe_limit),
+        ).fetchall()
+
+        doc_ids = [int(row["doc_id"]) for row in fts_rows]
+        docs_by_id: dict[int, sqlite3.Row] = {}
+        for chunk in iter_sqlite_chunks(doc_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            meta_rows = conn.execute(
+                f"SELECT id, title, slug, created_at, updated_at FROM docs WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            docs_by_id.update({int(row["id"]): row for row in meta_rows})
+
+        tag_map = build_doc_tag_map(conn, doc_ids)
+        for row in fts_rows:
+            doc_id = int(row["doc_id"])
+            doc_meta = docs_by_id.get(doc_id)
+            if not doc_meta:
+                continue
+            merged_by_doc_id[doc_id] = {
+                "title": str(doc_meta["title"]),
+                "slug": str(doc_meta["slug"]),
+                "created_at": str(doc_meta["created_at"]),
+                "updated_at": str(doc_meta["updated_at"]),
+                "tags": tag_map.get(doc_id, []),
+                "excerpt": str(row["excerpt"] or ""),
+                "matched_tags": [],
+            }
+            ordered_doc_ids.append(doc_id)
+    except sqlite3.OperationalError:
+        error = "검색식이 올바르지 않습니다. 예: flask AND sqlite, python NOT django"
+
+    tag_hits = search_docs_by_tags(conn, normalized_query, limit=safe_limit)
+    tag_only_doc_ids = [
+        int(hit["doc_id"])
+        for hit in tag_hits
+        if int(hit["doc_id"]) not in merged_by_doc_id
+    ]
+    tag_only_tag_map = build_doc_tag_map(conn, tag_only_doc_ids)
+    for hit in tag_hits:
+        doc_id = int(hit["doc_id"])
+        if doc_id in merged_by_doc_id:
+            existing = merged_by_doc_id[doc_id]
+            existing_tags = [str(tag) for tag in existing.get("matched_tags", [])]
+            existing["matched_tags"] = parse_tags(",".join([*existing_tags, *hit["matched_tags"]]))
+            continue
+
+        tag_doc = {
+            "title": str(hit["title"]),
+            "slug": str(hit["slug"]),
+            "tags": tag_only_tag_map.get(doc_id, []),
+            "created_at": str(hit["created_at"]),
+            "updated_at": str(hit["updated_at"]),
+            "excerpt": "",
+            "matched_tags": [str(tag) for tag in hit["matched_tags"]],
+        }
+        merged_by_doc_id[doc_id] = tag_doc
+        ordered_doc_ids.append(doc_id)
+
+    return [merged_by_doc_id[doc_id] for doc_id in ordered_doc_ids], error
+
+
+def client_api_error(
+    code: str,
+    message: str,
+    status: int,
+    **details: object,
+) -> tuple[object, int]:
+    """A compact JSON error shape that both native and browser clients can read."""
+    payload: dict[str, object] = {
+        # Keep this a string for PersonalWikiClient's tolerant JSON reader.
+        "error": message,
+        "error_code": code,
+        "message": message,
+    }
+    payload.update(details)
+    return jsonify(payload), status
+
+
+def client_api_payload() -> tuple[dict[str, object] | None, tuple[object, int] | None]:
+    payload = request_json_object()
+    if payload is None:
+        return None, client_api_error(
+            "invalid_json",
+            "JSON object body is required.",
+            400,
+        )
+    return payload, None
+
+
+def tag_suggestion_request_payload(
+) -> tuple[dict[str, object] | None, tuple[str, str, int] | None]:
+    """Read a bounded suggestion body before JSON decoding it.
+
+    Suggestion calls never need to upload a multi-megabyte document: the
+    recommender itself intentionally examines only a bounded prefix.  Reject
+    a missing Content-Length as well, because otherwise chunked input could
+    bypass this pre-decode protection and make Flask materialize an unlimited
+    body first.
+    """
+    content_length = request.content_length
+    if content_length is None or content_length > TAG_SUGGESTION_MAX_REQUEST_BYTES:
+        return None, (
+            "tag_suggestion_payload_too_large",
+            "태그 추천 요청 본문이 너무 큽니다.",
+            413,
+        )
+    payload = request_json_object()
+    if payload is None:
+        return None, (
+            "invalid_json",
+            "JSON object body is required.",
+            400,
+        )
+    return payload, None
+
+
+def parse_tag_suggestion_tags(
+    raw_tags: object,
+) -> tuple[list[str] | None, tuple[str, str, int] | None]:
+    """Validate tags before joining/parsing an attacker-controlled list."""
+    if isinstance(raw_tags, str):
+        if len(raw_tags) > TAG_SUGGESTION_MAX_TAG_TEXT_CHARS:
+            return None, (
+                "tag_suggestion_too_large",
+                "태그 추천은 최대 100개, 태그당 256자까지 지원합니다.",
+                413,
+            )
+        raw_parts = raw_tags.split(",")
+    elif isinstance(raw_tags, list):
+        if len(raw_tags) > TAG_SUGGESTION_MAX_TAGS:
+            return None, (
+                "tag_suggestion_too_large",
+                "태그 추천은 최대 100개, 태그당 256자까지 지원합니다.",
+                413,
+            )
+        if not all(isinstance(tag, str) for tag in raw_tags):
+            return None, (
+                "invalid_tag_suggestion",
+                "tags must be a string or an array of strings.",
+                400,
+            )
+        raw_parts = raw_tags
+    else:
+        return None, (
+            "invalid_tag_suggestion",
+            "tags must be a string or an array of strings.",
+            400,
+        )
+
+    if len(raw_parts) > TAG_SUGGESTION_MAX_TAGS or any(
+        len(part.strip()) > TAG_SUGGESTION_MAX_TAG_CHARS for part in raw_parts
+    ):
+        return None, (
+            "tag_suggestion_too_large",
+            "태그 추천은 최대 100개, 태그당 256자까지 지원합니다.",
+            413,
+        )
+    return parse_tags(",".join(raw_parts)), None
+
+
+def parse_tag_suggestion_payload(
+    payload: dict[str, object],
+) -> tuple[tuple[str, str, list[str], str | None] | None, tuple[str, str, int] | None]:
+    """Normalize one bounded tag-suggestion request for both API variants."""
+    title = payload.get("title", "")
+    content = payload.get("content", "")
+    current_slug = payload.get("slug")
+    if not isinstance(title, str) or not isinstance(content, str):
+        return None, (
+            "invalid_tag_suggestion",
+            "title and content must be strings.",
+            400,
+        )
+    if len(title) > TAG_SUGGESTION_MAX_TITLE_CHARS or len(content) > TAG_SUGGESTION_MAX_CONTENT_CHARS:
+        return None, (
+            "tag_suggestion_too_large",
+            "태그 추천은 제목 8,192자와 본문 1,000,000자까지 분석합니다.",
+            413,
+        )
+    if current_slug is not None and (
+        not isinstance(current_slug, str) or len(current_slug) > TAG_SUGGESTION_MAX_SLUG_CHARS
+    ):
+        return None, (
+            "invalid_tag_suggestion",
+            "slug must be a string up to 512 characters.",
+            400,
+        )
+
+    tags, tag_error = parse_tag_suggestion_tags(payload.get("tags", []))
+    if tag_error is not None:
+        return None, tag_error
+    assert tags is not None
+    normalized_slug = current_slug.strip() if isinstance(current_slug, str) else ""
+    return (
+        title.strip(),
+        normalize_newlines(content),
+        tags,
+        normalized_slug or None,
+    ), None
+
+
+def client_api_pagination() -> tuple[tuple[int | None, int] | None, tuple[object, int] | None]:
+    """Parse explicit bounded pages while preserving an untruncated default list."""
+    raw_limit = request.args.get("limit")
+    raw_offset = request.args.get("offset", "0").strip()
+    if not raw_offset.isascii() or not raw_offset.isdigit():
+        return None, client_api_error(
+            "invalid_pagination",
+            "limit and offset must be non-negative integers.",
+            400,
+        )
+    offset = int(raw_offset)
+    if offset > 9_223_372_036_854_775_807:
+        return None, client_api_error(
+            "invalid_pagination",
+            "offset is outside the supported range.",
+            400,
+        )
+    if raw_limit is None:
+        return (None, offset), None
+    raw_limit = raw_limit.strip()
+    if not raw_limit.isascii() or not raw_limit.isdigit():
+        return None, client_api_error(
+            "invalid_pagination",
+            "limit and offset must be non-negative integers.",
+            400,
+        )
+    limit = int(raw_limit)
+    if not 1 <= limit <= 1000:
+        return None, client_api_error(
+            "invalid_pagination",
+            "limit must be between 1 and 1000.",
+            400,
+        )
+    return (limit, offset), None
+
+
+def client_document_submission_from_payload(
+    payload: dict[str, object],
+) -> tuple[dict[str, object] | None, tuple[object, int] | None]:
+    title = payload.get("title", "")
+    content = payload.get("content", "")
+    raw_tags = payload.get("tags", [])
+    if not isinstance(title, str) or not isinstance(content, str):
+        return None, client_api_error(
+            "invalid_document",
+            "title and content must be strings.",
+            400,
+        )
+    if isinstance(raw_tags, str):
+        tags = parse_tags(raw_tags)
+    elif isinstance(raw_tags, list) and all(isinstance(tag, str) for tag in raw_tags):
+        tags = parse_tags(",".join(raw_tags))
+    else:
+        return None, client_api_error(
+            "invalid_document",
+            "tags must be a string or an array of strings.",
+            400,
+        )
+
+    ignore_tag_warning = payload.get("ignore_tag_warning", False)
+    save_as_is = payload.get("save_as_is", False)
+    if not isinstance(ignore_tag_warning, bool) or not isinstance(save_as_is, bool):
+        return None, client_api_error(
+            "invalid_document",
+            "ignore_tag_warning and save_as_is must be booleans.",
+            400,
+        )
+
+    spellcheck_action = payload.get("spellcheck_action", "")
+    if not isinstance(spellcheck_action, str):
+        return None, client_api_error(
+            "invalid_document",
+            "spellcheck_action must be a string.",
+            400,
+        )
+    if save_as_is:
+        spellcheck_action = "save_as_is"
+
+    return {
+        "title": title,
+        "content": content,
+        "tags": tags,
+        "ignore_tag_warning": ignore_tag_warning,
+        "spellcheck_action": spellcheck_action,
+    }, None
+
+
+def client_validation_response(
+    validation: DocumentSubmissionValidation,
+    *,
+    suggested_tags: list[str],
+) -> tuple[object, int] | None:
+    """Map form validation/confirmation state onto the documented JSON contract."""
+    base: dict[str, object] = {
+        "suggested_tags": suggested_tags,
+        "title_warning": validation.title_warning,
+        "document": {
+            "title": validation.title,
+            "content": validation.content,
+            "tags": validation.tags,
+        },
+    }
+    if validation.error:
+        return client_api_error(
+            validation.error_code or "validation_error",
+            validation.error,
+            400,
+            **base,
+        )
+    if validation.tag_warning:
+        return client_api_error(
+            "tag_confirmation_required",
+            validation.tag_warning,
+            409,
+            warning=validation.tag_warning,
+            tag_warning=validation.tag_warning,
+            needs_tag_warning_decision=True,
+            **base,
+        )
+    if validation.spell_warning:
+        return client_api_error(
+            "spellcheck_confirmation_required",
+            validation.spell_warning,
+            409,
+            warning=validation.spell_warning,
+            spell_warning=validation.spell_warning,
+            spellcheck_samples=validation.spellcheck_samples,
+            needs_spellcheck_decision=True,
+            **base,
+        )
+    return None
 
 
 @app.template_filter("pretty_time")
@@ -2230,11 +3411,418 @@ def pretty_time_filter(value: str) -> str:
         return value
 
 
+@app.context_processor
+def inject_browser_settings() -> dict[str, Markup]:
+    """Expose only the validated browser font CSS to Jinja templates."""
+    settings = read_wiki_settings()
+    return {"browser_font_css": Markup(browser_font_css(settings.browser_font))}
+
+
 @app.route("/")
 def index():
     conn = get_db()
     docs = fetch_docs_for_index(conn)
     return render_template("index.html", docs=docs)
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    current_settings = read_wiki_settings()
+    form_port = str(current_settings.port)
+    form_browser_font = browser_font_form_value(current_settings.browser_font)
+    form_browser_font_custom = browser_font_custom_name(current_settings.browser_font)
+    error: str | None = None
+
+    if request.method == "POST":
+        form_port = request.form.get("port", "").strip()
+        form_browser_font = request.form.get("browser_font", "").strip().casefold()
+        form_browser_font_custom = request.form.get("browser_font_custom", "").strip()
+        port = _parse_server_port(form_port)
+        browser_font = parse_browser_font_form(form_browser_font, form_browser_font_custom)
+
+        if port is None:
+            error = "포트 번호는 1에서 65535 사이의 숫자로 입력해 주세요."
+        elif browser_font is None:
+            error = "글꼴은 목록에서 선택하거나 안전한 설치 글꼴 이름을 입력해 주세요."
+        else:
+            try:
+                write_wiki_settings(WikiSettings(port=port, browser_font=browser_font))
+            except OSError:
+                error = "설정 파일을 저장하지 못했습니다. 파일 권한과 사용 중인 프로그램을 확인해 주세요."
+            else:
+                restart_required = "1" if port != current_settings.port else "0"
+                return redirect(
+                    url_for(
+                        "settings",
+                        saved="1",
+                        restart_required=restart_required,
+                    )
+                )
+
+    return render_template(
+        "settings.html",
+        wiki_settings=current_settings,
+        browser_font_options=BROWSER_FONT_OPTIONS,
+        form_port=form_port,
+        form_browser_font=form_browser_font,
+        form_browser_font_custom=form_browser_font_custom,
+        error=error,
+        saved=request.args.get("saved") == "1",
+        restart_required=request.args.get("restart_required") == "1",
+    )
+
+
+@app.get("/api/client/bootstrap")
+def client_api_bootstrap():
+    ast_available = native_ast_renderer_available()
+    return jsonify(
+        {
+            "api_version": CLIENT_API_VERSION,
+            "ast": {
+                "available": ast_available,
+                "format": "personalwiki-native-ast-v1",
+            },
+            "capabilities": {
+                "documents": True,
+                "search": True,
+                "tags": True,
+                "tag_suggestions": True,
+                "native_render": ast_available,
+            },
+        }
+    )
+
+
+@app.get("/api/client/documents")
+def client_list_documents():
+    pagination, pagination_error = client_api_pagination()
+    if pagination_error is not None:
+        return pagination_error
+    assert pagination is not None
+    limit, offset = pagination
+    conn = get_db()
+    total = int(conn.execute("SELECT COUNT(*) AS count FROM docs").fetchone()["count"])
+    documents = [
+        client_document_summary(doc)
+        for doc in fetch_docs_for_index(conn, limit=limit, offset=offset)
+    ]
+    next_offset = offset + len(documents) if limit is not None else None
+    return jsonify(
+        {
+            "api_version": CLIENT_API_VERSION,
+            "documents": documents,
+            # `items` lets lightweight callers use the same response shape as
+            # other collection endpoints without requiring a second request.
+            "items": documents,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "next_offset": next_offset if next_offset is not None and next_offset < total else None,
+            },
+        }
+    )
+
+
+def client_document_response(doc: dict[str, object]) -> tuple[object, int] | object:
+    content = read_document_if_exists(str(doc["slug"]))
+    if content is None:
+        return client_api_error(
+            "document_source_missing",
+            "문서 원본 파일을 찾을 수 없습니다.",
+            409,
+        )
+    try:
+        ast = render_native_ast(get_db(), content)
+    except NativeAstUnavailable:
+        return client_api_error(
+            "ast_unavailable",
+            "이 서버에는 PersonalWikiClient용 네이티브 Markdown AST 렌더러가 없습니다. PersonalWiki를 업데이트한 뒤 다시 시도해 주세요.",
+            503,
+        )
+    except NativeAstFormatError:
+        return client_api_error(
+            "ast_invalid",
+            "네이티브 Markdown AST 렌더러가 올바르지 않은 결과를 반환했습니다.",
+            500,
+        )
+    return jsonify(
+        {
+            "api_version": CLIENT_API_VERSION,
+            "document": client_document_payload(get_db(), doc, content),
+            "ast": ast,
+            "backlinks": client_backlink_summaries(find_backlinks(get_db(), str(doc["slug"]))),
+        }
+    )
+
+
+@app.get("/api/client/documents/<path:slug>")
+def client_get_document(slug: str):
+    doc = fetch_doc_with_tags(get_db(), slug)
+    if doc is None:
+        return client_api_error("document_not_found", "문서를 찾을 수 없습니다.", 404)
+    return client_document_response(doc)
+
+
+def client_saved_document_response(
+    conn: sqlite3.Connection,
+    saved: dict[str, object],
+    validation: DocumentSubmissionValidation,
+    *,
+    status: int,
+) -> tuple[object, int]:
+    content = read_document(str(saved["slug"]))
+    warnings = [validation.title_warning] if validation.title_warning else []
+    return (
+        jsonify(
+            {
+                "api_version": CLIENT_API_VERSION,
+                "document": client_document_payload(conn, saved, content),
+                "warnings": warnings,
+                "title_warning": validation.title_warning,
+            }
+        ),
+        status,
+    )
+
+
+def client_document_validation(
+    conn: sqlite3.Connection,
+    fts_conn: sqlite3.Connection,
+    token_conn: sqlite3.Connection,
+    submission: dict[str, object],
+    *,
+    is_new: bool,
+    current_doc_id: int | None = None,
+    current_slug: str | None = None,
+) -> tuple[DocumentSubmissionValidation, tuple[object, int] | None]:
+    validation = validate_document_submission(
+        conn,
+        title=str(submission["title"]),
+        content=str(submission["content"]),
+        tags=list(submission["tags"]),
+        is_new=is_new,
+        current_doc_id=current_doc_id,
+        ignore_tag_warning=bool(submission["ignore_tag_warning"]),
+        spellcheck_action=str(submission["spellcheck_action"]),
+    )
+    suggestions = document_tag_suggestions(
+        conn,
+        fts_conn,
+        token_conn,
+        title=validation.title,
+        content=validation.content,
+        tags=validation.tags,
+        current_slug=current_slug,
+    )
+    return validation, client_validation_response(validation, suggested_tags=suggestions)
+
+
+@app.post("/api/client/documents")
+def client_create_document():
+    payload, payload_error = client_api_payload()
+    if payload_error is not None:
+        return payload_error
+    assert payload is not None
+    submission, submission_error = client_document_submission_from_payload(payload)
+    if submission_error is not None:
+        return submission_error
+    assert submission is not None
+
+    conn = get_db()
+    fts_conn = get_fts_db()
+    token_conn = get_token_db()
+    validation, validation_response = client_document_validation(
+        conn,
+        fts_conn,
+        token_conn,
+        submission,
+        is_new=True,
+    )
+    if validation_response is not None:
+        return validation_response
+    try:
+        saved = create_document_record(
+            conn,
+            fts_conn,
+            token_conn,
+            title=validation.title,
+            content=validation.content,
+            tags=validation.tags,
+        )
+    except (OSError, sqlite3.Error, RuntimeError):
+        app.logger.exception("PersonalWikiClient document creation failed")
+        return client_api_error("persistence_failed", "문서를 저장하지 못했습니다.", 500)
+    return client_saved_document_response(conn, saved, validation, status=201)
+
+
+@app.put("/api/client/documents/<path:slug>")
+def client_update_document(slug: str):
+    payload, payload_error = client_api_payload()
+    if payload_error is not None:
+        return payload_error
+    assert payload is not None
+    submission, submission_error = client_document_submission_from_payload(payload)
+    if submission_error is not None:
+        return submission_error
+    assert submission is not None
+
+    conn = get_db()
+    fts_conn = get_fts_db()
+    token_conn = get_token_db()
+    row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        return client_api_error("document_not_found", "문서를 찾을 수 없습니다.", 404)
+    validation, validation_response = client_document_validation(
+        conn,
+        fts_conn,
+        token_conn,
+        submission,
+        is_new=False,
+        current_doc_id=int(row["id"]),
+        current_slug=str(row["slug"]),
+    )
+    if validation_response is not None:
+        return validation_response
+    try:
+        saved = update_document_record(
+            conn,
+            fts_conn,
+            token_conn,
+            row=row,
+            title=validation.title,
+            content=validation.content,
+            tags=validation.tags,
+        )
+    except (OSError, sqlite3.Error, RuntimeError):
+        app.logger.exception("PersonalWikiClient document update failed")
+        return client_api_error("persistence_failed", "문서를 저장하지 못했습니다.", 500)
+    return client_saved_document_response(conn, saved, validation, status=200)
+
+
+@app.delete("/api/client/documents/<path:slug>")
+def client_delete_document(slug: str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        return client_api_error("document_not_found", "문서를 찾을 수 없습니다.", 404)
+    try:
+        delete_document_record(conn, get_fts_db(), get_token_db(), row=row)
+    except (OSError, sqlite3.Error, RuntimeError):
+        app.logger.exception("PersonalWikiClient document deletion failed")
+        return client_api_error("persistence_failed", "문서를 삭제하지 못했습니다.", 500)
+    return jsonify({"api_version": CLIENT_API_VERSION, "deleted": True, "slug": slug})
+
+
+@app.get("/api/client/tags")
+def client_list_tags():
+    tags = list_client_tags(get_db())
+    return jsonify({"api_version": CLIENT_API_VERSION, "tags": tags, "items": tags})
+
+
+def client_tag_documents_response(tag_name: str):
+    conn = get_db()
+    matched_documents = fetch_docs_by_tag(conn, tag_name)
+    tag_map = build_doc_tag_map(
+        conn,
+        [int(document["id"]) for document in matched_documents],
+    )
+    documents: list[dict[str, object]] = []
+    for doc in matched_documents:
+        document = dict(doc)
+        document["tags"] = tag_map.get(int(document["id"]), [])
+        documents.append(client_document_summary(document))
+    return jsonify(
+        {
+            "api_version": CLIENT_API_VERSION,
+            "tag": tag_name,
+            "documents": documents,
+            "items": documents,
+        }
+    )
+
+
+@app.get("/api/client/tags/<path:tag_name>")
+def client_tag_documents(tag_name: str):
+    return client_tag_documents_response(tag_name)
+
+
+@app.get("/api/client/tags/<path:tag_name>/documents")
+def client_tag_documents_alias(tag_name: str):
+    """Compatibility alias for clients that model tags as a collection resource."""
+    return client_tag_documents_response(tag_name)
+
+
+@app.get("/api/client/search")
+def client_search_documents():
+    query = request.args.get("q", "").strip()
+    results, error = search_documents(get_db(), get_fts_db(), query)
+    if error is not None:
+        return client_api_error("invalid_search_query", error, 400, results=results)
+    documents = [client_document_summary(result) for result in results]
+    for document, result in zip(documents, results):
+        document["excerpt"] = str(result.get("excerpt", ""))
+        document["matched_tags"] = [str(tag) for tag in result.get("matched_tags", [])]
+    return jsonify(
+        {
+            "api_version": CLIENT_API_VERSION,
+            "query": query,
+            "documents": documents,
+            "results": documents,
+            "items": documents,
+        }
+    )
+
+
+@app.post("/api/client/render")
+def client_render_document():
+    payload, payload_error = client_api_payload()
+    if payload_error is not None:
+        return payload_error
+    assert payload is not None
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return client_api_error("invalid_render", "content must be a string.", 400)
+    try:
+        ast = render_native_ast(get_db(), normalize_newlines(content))
+    except NativeAstUnavailable:
+        return client_api_error(
+            "ast_unavailable",
+            "이 서버에는 PersonalWikiClient용 네이티브 Markdown AST 렌더러가 없습니다. PersonalWiki를 업데이트한 뒤 다시 시도해 주세요.",
+            503,
+        )
+    except NativeAstFormatError:
+        return client_api_error(
+            "ast_invalid",
+            "네이티브 Markdown AST 렌더러가 올바르지 않은 결과를 반환했습니다.",
+            500,
+        )
+    return jsonify({"api_version": CLIENT_API_VERSION, "ast": ast})
+
+
+@app.post("/api/client/tag-suggestions")
+def client_tag_suggestions():
+    payload, payload_error = tag_suggestion_request_payload()
+    if payload_error is not None:
+        return client_api_error(*payload_error)
+    assert payload is not None
+
+    suggestion_input, input_error = parse_tag_suggestion_payload(payload)
+    if input_error is not None:
+        return client_api_error(*input_error)
+    assert suggestion_input is not None
+    title, content, tags, current_slug = suggestion_input
+
+    suggestions = document_tag_suggestions(
+        get_db(),
+        get_fts_db(),
+        get_token_db(),
+        title=title,
+        content=content,
+        tags=tags,
+        current_slug=current_slug,
+    )
+    return jsonify({"api_version": CLIENT_API_VERSION, "tags": suggestions, "suggestions": suggestions})
 
 
 @app.route("/doc/<path:slug>")
@@ -2268,146 +3856,76 @@ def new_doc():
         tags = parse_tags(request.form.get("tags", ""))
         ignore_tag_warning = request.form.get("ignore_tag_warning") == "1"
         spellcheck_action = request.form.get("spellcheck_action", "")
-        if spellcheck_action == "auto_fix":
-            title, content = apply_korean_spell_autofix(title, content)
+        validation = validate_document_submission(
+            conn,
+            title=title,
+            content=content,
+            tags=tags,
+            is_new=True,
+            ignore_tag_warning=ignore_tag_warning,
+            spellcheck_action=spellcheck_action,
+        )
 
-        def suggested_tags_for_form() -> list[str]:
-            return recommend_tags(
+        def suggested_tags_for_validation() -> list[str]:
+            return document_tag_suggestions(
                 conn,
                 fts_conn,
                 token_conn,
-                title=title,
-                content=content,
-                exclude_tags=tags,
-                limit=TAG_RECOMMEND_LIMIT,
+                title=validation.title,
+                content=validation.content,
+                tags=validation.tags,
             )
 
-        title_warning = title_prefix_warning(title)
-
-        if not title:
+        if validation.error:
             return render_edit_form(
                 mode="new",
-                doc={"title": "", "slug": ""},
-                content=content,
-                tags_text=", ".join(tags),
-                error="문서 제목을 입력해 주세요.",
+                doc={"title": validation.title, "slug": ""},
+                content=validation.content,
+                tags_text=", ".join(validation.tags),
+                error=validation.error,
                 tag_warning=None,
-                title_warning=title_warning,
+                title_warning=validation.title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags_for_form(),
+                recommended_tags=suggested_tags_for_validation(),
             )
-
-        duplicate = conn.execute(
-            "SELECT 1 FROM docs WHERE title = ? COLLATE NOCASE",
-            (title,),
-        ).fetchone()
-        if duplicate:
+        if validation.tag_warning:
             return render_edit_form(
                 mode="new",
-                doc={"title": title, "slug": ""},
-                content=content,
-                tags_text=", ".join(tags),
-                error="같은 제목의 문서가 이미 있습니다.",
-                tag_warning=None,
-                title_warning=title_warning,
-                show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags_for_form(),
-            )
-
-        if len(tags) < 2 and not ignore_tag_warning:
-            return render_edit_form(
-                mode="new",
-                doc={"title": title, "slug": ""},
-                content=content,
-                tags_text=", ".join(tags),
+                doc={"title": validation.title, "slug": ""},
+                content=validation.content,
+                tags_text=", ".join(validation.tags),
                 error=None,
-                tag_warning="태그를 2개 이상 등록하면 나중에 검색이 더 쉬워집니다. 계속 생성하려면 아래 버튼을 눌러 주세요.",
-                title_warning=title_warning,
+                tag_warning=validation.tag_warning,
+                title_warning=validation.title_warning,
                 show_ignore_tag_warning=True,
-                recommended_tags=suggested_tags_for_form(),
+                recommended_tags=suggested_tags_for_validation(),
+            )
+        if validation.spell_warning:
+            return render_edit_form(
+                mode="new",
+                doc={"title": validation.title, "slug": ""},
+                content=validation.content,
+                tags_text=", ".join(validation.tags),
+                error=None,
+                tag_warning=None,
+                title_warning=validation.title_warning,
+                show_ignore_tag_warning=False,
+                ignore_tag_warning=ignore_tag_warning,
+                spell_warning=validation.spell_warning,
+                show_spellcheck_warning=True,
+                spellcheck_samples=validation.spellcheck_samples,
+                recommended_tags=suggested_tags_for_validation(),
             )
 
-        if spellcheck_action not in {"auto_fix", "save_as_is"}:
-            spell_issues = collect_korean_spell_issues(title, content)
-            if spell_issues:
-                return render_edit_form(
-                    mode="new",
-                    doc={"title": title, "slug": ""},
-                    content=content,
-                    tags_text=", ".join(tags),
-                    error=None,
-                    tag_warning=None,
-                    title_warning=title_warning,
-                    show_ignore_tag_warning=False,
-                    ignore_tag_warning=ignore_tag_warning,
-                    spell_warning=korean_spell_warning_message(spell_issues["count"]),
-                    show_spellcheck_warning=True,
-                    spellcheck_samples=spell_issues["samples"],
-                    recommended_tags=suggested_tags_for_form(),
-                )
-
-        slug = ensure_unique_slug(conn, slugify(title))
-        created_at = now_iso()
-        meta = {"sidecar": f"json/{slug}.json"}
-        created_assets: list[Path] = []
-        main_committed = False
-        try:
-            ensure_document_asset_targets_available(slug)
-            references = extract_reference_payload(content)
-            write_document(slug, content)
-            created_assets.append(document_path(slug))
-            content_mtime_ns, content_size = document_file_state(document_path(slug))
-            write_sidecar(
-                slug=slug,
-                title=title,
-                created_at=created_at,
-                updated_at=created_at,
-                tags=tags,
-                meta=meta,
-                references=references,
-            )
-            created_assets.append(sidecar_path(slug))
-            conn.execute(
-                """
-                INSERT INTO docs
-                (title, slug, file_path, meta_json, created_at, updated_at, content_mtime_ns, content_size)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    title,
-                    slug,
-                    str(document_path(slug)),
-                    json.dumps(meta, ensure_ascii=False),
-                    created_at,
-                    created_at,
-                    content_mtime_ns,
-                    content_size,
-                ),
-            )
-            doc_id = conn.execute("SELECT id FROM docs WHERE slug = ?", (slug,)).fetchone()["id"]
-
-            set_doc_tags(conn, doc_id, tags)
-            set_doc_references(conn, doc_id, references)
-            bump_corpus_revision(conn)
-            update_fts(fts_conn, doc_id, title, content)
-            upsert_language_doc_tokens(token_conn, conn, doc_id, title, content)
-            mark_fts_index_current(conn, fts_conn)
-            mark_sidecar_sync_state(conn)
-            conn.commit()
-            main_committed = True
-            fts_conn.commit()
-            token_conn.commit()
-            invalidate_tag_recommendation_cache()
-        except Exception:
-            if main_committed:
-                invalidate_tag_recommendation_cache()
-            else:
-                conn.rollback()
-                discard_document_assets(created_assets)
-            fts_conn.rollback()
-            token_conn.rollback()
-            raise
-        return redirect(url_for("view_doc", slug=slug))
+        saved = create_document_record(
+            conn,
+            fts_conn,
+            token_conn,
+            title=validation.title,
+            content=validation.content,
+            tags=validation.tags,
+        )
+        return redirect(url_for("view_doc", slug=str(saved["slug"])))
 
     prefilled_title = request.args.get("title", "").strip()
     return render_edit_form(
@@ -2441,142 +3959,65 @@ def edit_doc(slug: str):
         new_content = normalize_newlines(request.form.get("content", ""))
         new_tags = parse_tags(request.form.get("tags", ""))
         spellcheck_action = request.form.get("spellcheck_action", "")
-        if spellcheck_action == "auto_fix":
-            new_title, new_content = apply_korean_spell_autofix(new_title, new_content)
+        validation = validate_document_submission(
+            conn,
+            title=new_title,
+            content=new_content,
+            tags=new_tags,
+            is_new=False,
+            current_doc_id=int(row["id"]),
+            spellcheck_action=spellcheck_action,
+        )
 
-        def suggested_tags_for_form() -> list[str]:
-            return recommend_tags(
+        def suggested_tags_for_validation() -> list[str]:
+            return document_tag_suggestions(
                 conn,
                 fts_conn,
                 token_conn,
-                title=new_title or row["title"],
-                content=new_content,
-                current_slug=row["slug"],
-                exclude_tags=new_tags,
-                limit=TAG_RECOMMEND_LIMIT,
+                title=validation.title or str(row["title"]),
+                content=validation.content,
+                tags=validation.tags,
+                current_slug=str(row["slug"]),
             )
 
-        title_warning = title_prefix_warning(new_title)
-
-        if not new_title:
+        if validation.error:
             return render_edit_form(
                 mode="edit",
                 doc=doc,
-                content=new_content,
-                tags_text=", ".join(new_tags),
-                error="문서 제목을 입력해 주세요.",
+                content=validation.content,
+                tags_text=", ".join(validation.tags),
+                error=validation.error,
                 tag_warning=None,
-                title_warning=title_warning,
+                title_warning=validation.title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags_for_form(),
+                recommended_tags=suggested_tags_for_validation(),
             )
-
-        duplicate = conn.execute(
-            "SELECT id FROM docs WHERE title = ? COLLATE NOCASE AND id != ?",
-            (new_title, row["id"]),
-        ).fetchone()
-        if duplicate:
+        if validation.spell_warning:
             return render_edit_form(
                 mode="edit",
                 doc=doc,
-                content=new_content,
-                tags_text=", ".join(new_tags),
-                error="같은 제목의 문서가 이미 있습니다.",
+                content=validation.content,
+                tags_text=", ".join(validation.tags),
+                error=None,
                 tag_warning=None,
-                title_warning=title_warning,
+                title_warning=validation.title_warning,
                 show_ignore_tag_warning=False,
-                recommended_tags=suggested_tags_for_form(),
+                spell_warning=validation.spell_warning,
+                show_spellcheck_warning=True,
+                spellcheck_samples=validation.spellcheck_samples,
+                recommended_tags=suggested_tags_for_validation(),
             )
 
-        if spellcheck_action not in {"auto_fix", "save_as_is"}:
-            spell_issues = collect_korean_spell_issues(new_title, new_content)
-            if spell_issues:
-                return render_edit_form(
-                    mode="edit",
-                    doc=doc,
-                    content=new_content,
-                    tags_text=", ".join(new_tags),
-                    error=None,
-                    tag_warning=None,
-                    title_warning=title_warning,
-                    show_ignore_tag_warning=False,
-                    spell_warning=korean_spell_warning_message(spell_issues["count"]),
-                    show_spellcheck_warning=True,
-                    spellcheck_samples=spell_issues["samples"],
-                    recommended_tags=suggested_tags_for_form(),
-                )
-
-        new_slug_candidate = slugify(new_title)
-        new_slug = ensure_unique_slug(conn, new_slug_candidate, exclude_doc_id=row["id"])
-        old_slug = row["slug"]
-
-        updated_at = now_iso()
-        meta = safe_load_json(row["meta_json"])
-        meta["sidecar"] = f"json/{new_slug}.json"
-        staged_assets: list[tuple[Path, Path]] = []
-        created_assets: list[Path] = []
-        main_committed = False
-        try:
-            if new_slug != old_slug:
-                ensure_document_asset_targets_available(new_slug)
-            staged_assets = stage_document_assets(old_slug, operation="edit")
-            references = extract_reference_payload(new_content)
-            write_document(new_slug, new_content)
-            created_assets.append(document_path(new_slug))
-            content_mtime_ns, content_size = document_file_state(document_path(new_slug))
-            write_sidecar(
-                slug=new_slug,
-                title=new_title,
-                created_at=row["created_at"],
-                updated_at=updated_at,
-                tags=new_tags,
-                meta=meta,
-                references=references,
-            )
-            created_assets.append(sidecar_path(new_slug))
-            conn.execute(
-                """
-                UPDATE docs
-                SET title = ?, slug = ?, file_path = ?, meta_json = ?, updated_at = ?,
-                    content_mtime_ns = ?, content_size = ?
-                WHERE id = ?
-                """,
-                (
-                    new_title,
-                    new_slug,
-                    str(document_path(new_slug)),
-                    json.dumps(meta, ensure_ascii=False),
-                    updated_at,
-                    content_mtime_ns,
-                    content_size,
-                    row["id"],
-                ),
-            )
-            set_doc_tags(conn, row["id"], new_tags)
-            set_doc_references(conn, row["id"], references)
-            bump_corpus_revision(conn)
-            update_fts(fts_conn, row["id"], new_title, new_content)
-            upsert_language_doc_tokens(token_conn, conn, row["id"], new_title, new_content)
-            mark_fts_index_current(conn, fts_conn)
-            mark_sidecar_sync_state(conn)
-            conn.commit()
-            main_committed = True
-            fts_conn.commit()
-            token_conn.commit()
-            finalize_staged_document_assets(staged_assets)
-            invalidate_tag_recommendation_cache()
-        except Exception:
-            if main_committed:
-                finalize_staged_document_assets(staged_assets)
-                invalidate_tag_recommendation_cache()
-            else:
-                conn.rollback()
-                discard_document_assets(created_assets)
-                restore_staged_document_assets(staged_assets)
-            fts_conn.rollback()
-            token_conn.rollback()
-            raise
-        return redirect(url_for("view_doc", slug=new_slug))
+        saved = update_document_record(
+            conn,
+            fts_conn,
+            token_conn,
+            row=row,
+            title=validation.title,
+            content=validation.content,
+            tags=validation.tags,
+        )
+        return redirect(url_for("view_doc", slug=str(saved["slug"])))
 
     doc["tags"] = tags
     return render_edit_form(
@@ -2604,40 +4045,11 @@ def edit_doc(slug: str):
 @app.post("/delete/<path:slug>")
 def delete_doc(slug: str):
     conn = get_db()
-    fts_conn = get_fts_db()
-    token_conn = get_token_db()
     row = conn.execute("SELECT * FROM docs WHERE slug = ?", (slug,)).fetchone()
     if row is None:
         abort(404)
 
-    staged_assets: list[tuple[Path, Path]] = []
-    main_committed = False
-    try:
-        staged_assets = stage_document_assets(slug, operation="delete")
-        fts_conn.execute("DELETE FROM docs_fts WHERE rowid = ?", (row["id"],))
-        conn.execute("DELETE FROM docs WHERE id = ?", (row["id"],))
-        bump_corpus_revision(conn)
-        delete_language_doc_tokens(token_conn, conn, row["id"])
-        mark_fts_index_current(conn, fts_conn)
-        conn.commit()
-        main_committed = True
-        fts_conn.commit()
-        token_conn.commit()
-        finalize_staged_document_assets(staged_assets)
-        mark_sidecar_sync_state(conn)
-        conn.commit()
-        invalidate_tag_recommendation_cache()
-    except Exception:
-        if main_committed:
-            finalize_staged_document_assets(staged_assets)
-            invalidate_tag_recommendation_cache()
-        else:
-            conn.rollback()
-            restore_staged_document_assets(staged_assets)
-        fts_conn.rollback()
-        token_conn.rollback()
-        raise
-
+    delete_document_record(conn, get_fts_db(), get_token_db(), row=row)
     return redirect(url_for("index"))
 
 
@@ -2652,70 +4064,7 @@ def search():
     conn = get_db()
     fts_conn = get_fts_db()
     query = request.args.get("q", "").strip()
-    results: list[dict] = []
-    error: str | None = None
-
-    if query:
-        merged_by_doc_id: dict[int, dict] = {}
-        ordered_doc_ids: list[int] = []
-        normalized = normalize_search_query(query)
-
-        try:
-            fts_rows = fts_conn.execute(
-                """
-                SELECT
-                    rowid AS doc_id,
-                    snippet(docs_fts, 1, '<mark>', '</mark>', ' ... ', 24) AS excerpt
-                FROM docs_fts
-                WHERE docs_fts MATCH ?
-                ORDER BY bm25(docs_fts)
-                LIMIT 200
-                """,
-                (normalized,),
-            ).fetchall()
-
-            doc_ids = [int(row["doc_id"]) for row in fts_rows]
-            docs_by_id: dict[int, sqlite3.Row] = {}
-            if doc_ids:
-                placeholders = ",".join("?" for _ in doc_ids)
-                meta_rows = conn.execute(
-                    f"SELECT id, title, slug, updated_at FROM docs WHERE id IN ({placeholders})",
-                    doc_ids,
-                ).fetchall()
-                docs_by_id = {int(row["id"]): row for row in meta_rows}
-
-            for row in fts_rows:
-                doc_id = int(row["doc_id"])
-                doc_meta = docs_by_id.get(doc_id)
-                if not doc_meta:
-                    continue
-                merged_by_doc_id[doc_id] = {
-                    "title": doc_meta["title"],
-                    "slug": doc_meta["slug"],
-                    "excerpt": row["excerpt"],
-                    "matched_tags": [],
-                }
-                ordered_doc_ids.append(doc_id)
-        except sqlite3.OperationalError:
-            error = "검색식이 올바르지 않습니다. 예: flask AND sqlite, python NOT django"
-
-        for hit in search_docs_by_tags(conn, query, limit=200):
-            doc_id = int(hit["doc_id"])
-            if doc_id in merged_by_doc_id:
-                existing = merged_by_doc_id[doc_id]
-                existing_tags = [str(tag) for tag in existing.get("matched_tags", [])]
-                existing["matched_tags"] = parse_tags(",".join([*existing_tags, *hit["matched_tags"]]))
-                continue
-
-            merged_by_doc_id[doc_id] = {
-                "title": hit["title"],
-                "slug": hit["slug"],
-                "excerpt": "",
-                "matched_tags": hit["matched_tags"],
-            }
-            ordered_doc_ids.append(doc_id)
-
-        results = [merged_by_doc_id[doc_id] for doc_id in ordered_doc_ids]
+    results, error = search_documents(conn, fts_conn, query)
 
     return render_template(
         "search.html",
@@ -2841,19 +4190,16 @@ def preview():
 def tag_suggestions():
     conn = get_db()
     fts_conn = get_fts_db()
-    payload = request_json_object()
-    if payload is None:
-        return jsonify({"error": "JSON object body is required."}), 400
+    payload, payload_error = tag_suggestion_request_payload()
+    if payload_error is not None:
+        return client_api_error(*payload_error)
+    assert payload is not None
 
-    title = str(payload.get("title", "")).strip()
-    content = normalize_newlines(str(payload.get("content", "")))
-    current_slug = str(payload.get("slug", "")).strip() or None
-
-    raw_tags = payload.get("tags", "")
-    if isinstance(raw_tags, list):
-        tags = parse_tags(",".join(str(item) for item in raw_tags))
-    else:
-        tags = parse_tags(str(raw_tags))
+    suggestion_input, input_error = parse_tag_suggestion_payload(payload)
+    if input_error is not None:
+        return client_api_error(*input_error)
+    assert suggestion_input is not None
+    title, content, tags, current_slug = suggestion_input
 
     suggestions = recommend_tags(
         conn,
@@ -2886,6 +4232,9 @@ def favicon():
 def bootstrap() -> None:
     acquire_data_lock()
     init_storage()
+    if database_swap_recovery_pending():
+        if not run_db_fix_tool("interrupted database swap detected"):
+            raise RuntimeError("interrupted database swap could not be recovered by DBFix")
     try:
         init_db()
         init_fts_db()

@@ -5,7 +5,7 @@ import re
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Match, MutableMapping
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import mistune
 from mistune import BlockState, InlineState, Markdown
@@ -28,9 +28,14 @@ CALLOUT_LINE_RE = re.compile(
 )
 TOC_REF_RE = re.compile(r"^TOC(?P<level>[1-6])?$", flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+AST_BR_HTML_RE = re.compile(r"<br\s*/?\s*>", flags=re.IGNORECASE)
+AST_KBD_OPEN_HTML_RE = re.compile(r"<kbd\s*>", flags=re.IGNORECASE)
+AST_KBD_CLOSE_HTML_RE = re.compile(r"</kbd\s*>", flags=re.IGNORECASE)
 
 WIKI_CONTEXT_KEY = "personal_wiki_context"
 TEMPLATE_DISABLED_KEY = "personal_wiki_template_disabled"
+AST_RENDERING_KEY = "personal_wiki_ast_rendering"
+PERSONAL_WIKI_AST_VERSION = 1
 TOC_RESERVED_TITLES = ("TOC", "TOC1", "TOC2", "TOC3", "TOC4", "TOC5", "TOC6")
 TOC_DEFAULT_MAX_LEVEL = 2
 CALLOUT_ICONS = {
@@ -39,6 +44,12 @@ CALLOUT_ICONS = {
     "warn": ("!", "경고"),
     "danger": ("!", "위험"),
 }
+# The native client intentionally opens external links through the user's
+# default application.  Unlike a browser, ShellExecute can invoke arbitrary
+# registered Windows URI handlers, so its AST contract is stricter than a
+# general HTML href attribute.  Internal PersonalWiki URLs have no scheme;
+# external URLs are limited to ordinary web links.
+AST_SAFE_EXTERNAL_SCHEMES = {"http", "https"}
 
 
 def toc_max_level_from_ref(ref: str) -> int | None:
@@ -414,6 +425,10 @@ def _get_context(env: MutableMapping[str, object]) -> WikiRenderContext:
     return context
 
 
+def _is_ast_rendering(env: MutableMapping[str, object]) -> bool:
+    return bool(env.get(AST_RENDERING_KEY))
+
+
 def _load_template_content(ref: str, context: WikiRenderContext) -> str:
     slug = context.resolve_doc_reference(ref)
     if not slug:
@@ -428,7 +443,11 @@ def _load_template_content(ref: str, context: WikiRenderContext) -> str:
     return template_content
 
 
-def _render_template_content(md: Markdown, env: MutableMapping[str, object], content: str) -> str:
+def _render_template_content(
+    md: Markdown,
+    env: MutableMapping[str, object],
+    content: str,
+) -> str | list[dict[str, object]]:
     child = md.block.state_cls()
     child.env = env
     child.process(content if content.endswith("\n") else f"{content}\n")
@@ -437,7 +456,13 @@ def _render_template_content(md: Markdown, env: MutableMapping[str, object], con
     env[TEMPLATE_DISABLED_KEY] = True
     try:
         md.block.parse(child)
-        return str(md.render_state(child))
+        # HTML rendering returns a string.  The AST markdown instance has no
+        # renderer and returns parsed tokens, which lets template content stay
+        # structured instead of being serialized into an HTML/Python string.
+        rendered = md.render_state(child)
+        if isinstance(rendered, str):
+            return rendered
+        return list(rendered)
     finally:
         if previous:
             env[TEMPLATE_DISABLED_KEY] = previous
@@ -445,7 +470,11 @@ def _render_template_content(md: Markdown, env: MutableMapping[str, object], con
             env.pop(TEMPLATE_DISABLED_KEY, None)
 
 
-def _render_template_ref(md: Markdown, env: MutableMapping[str, object], ref: str) -> str:
+def _render_template_ref(
+    md: Markdown,
+    env: MutableMapping[str, object],
+    ref: str,
+) -> str | list[dict[str, object]]:
     context = _get_context(env)
     content = _load_template_content(ref, context)
     return _render_template_content(md, env, content)
@@ -524,6 +553,70 @@ def _render_youtube(raw: str) -> str | None:
     )
 
 
+def _parse_youtube_embed_ast(raw: str) -> dict[str, object] | None:
+    """Parse a YouTube shortcut into JSON-safe data without emitting HTML."""
+    match = YOUTUBE_RE.match(raw)
+    if not match:
+        return None
+
+    parts = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    if not parts:
+        return {
+            "type": "error",
+            "raw": "Invalid youtube embed: missing video id",
+            "attrs": {"kind": "youtube_embed"},
+        }
+
+    video_id = parts[0]
+    if not YOUTUBE_ID_RE.fullmatch(video_id):
+        return {
+            "type": "error",
+            "raw": f"Invalid youtube video id: {video_id}",
+            "attrs": {"kind": "youtube_embed"},
+        }
+
+    width: int | None = None
+    height: int | None = None
+    start: int | None = None
+    for option in parts[1:]:
+        if "=" not in option:
+            continue
+        key, value = [item.strip().lower() for item in option.split("=", 1)]
+        parsed_dimension = _parse_dimension_option(value)
+        if key == "width":
+            if parsed_dimension is not None:
+                width = parsed_dimension
+        elif key == "height":
+            if parsed_dimension is not None:
+                height = parsed_dimension
+        elif key == "start":
+            parsed_start = _parse_timestamp(value)
+            if parsed_start is not None and parsed_start >= 0:
+                start = parsed_start
+
+    if width is None and height is None:
+        width = 560
+        height = 315
+    elif width is None:
+        width = _youtube_width_from_height(height)
+    elif height is None:
+        height = _youtube_height_from_width(width)
+
+    url = f"https://www.youtube.com/embed/{quote(video_id)}"
+    if start is not None:
+        url += f"?start={start}"
+    return {
+        "type": "youtube",
+        "attrs": {
+            "video_id": video_id,
+            "url": url,
+            "width": width,
+            "height": height,
+            "start": start,
+        },
+    }
+
+
 def _tag_name_from_embed(raw: str) -> str | None:
     match = TAG_EMBED_RE.fullmatch(raw.strip())
     if match is None:
@@ -543,6 +636,25 @@ def _render_tag_embed(raw: str, context: WikiRenderContext) -> str | None:
         slug = quote(str(document["slug"]))
         links.append(f'<a href="/doc/{slug}">{title}</a>')
     return '<span class="tag-document-list">' + " ・ ".join(links) + "</span>"
+
+
+def _parse_tag_embed_ast(raw: str, context: WikiRenderContext) -> dict[str, object] | None:
+    tag_name = _tag_name_from_embed(raw)
+    if tag_name is None:
+        return None
+
+    documents: list[dict[str, str]] = []
+    for document in context.list_tag_documents(tag_name):
+        title = str(document.get("title", ""))
+        slug = str(document.get("slug", ""))
+        documents.append(
+            {
+                "title": title,
+                "slug": slug,
+                "url": f"/doc/{quote(slug)}",
+            }
+        )
+    return {"type": "tag_embed", "attrs": {"tag": tag_name, "documents": documents}}
 
 
 def _parse_image_shortcut(raw: str) -> dict[str, object]:
@@ -594,6 +706,61 @@ def _parse_image_shortcut(raw: str) -> dict[str, object]:
     return {"type": "raw", "html": f'<img src="/img/{safe}" alt="{safe_alt}" loading="lazy"{attrs}>'}
 
 
+def _parse_image_shortcut_ast(raw: str) -> dict[str, object]:
+    """Parse the ``![[...]]`` shortcut into a native-client node token."""
+    youtube = _parse_youtube_embed_ast(raw)
+    if youtube is not None:
+        return youtube
+
+    segments = [part.strip() for part in raw.split(",")]
+    main = segments[0] if segments else ""
+    options = segments[1:]
+
+    if "|" in main:
+        filename, alt = [part.strip() for part in main.split("|", 1)]
+    else:
+        filename = main
+        alt = Path(filename).stem or "image"
+
+    if not filename:
+        return {
+            "type": "error",
+            "raw": "Invalid image embed: missing file name",
+            "attrs": {"kind": "image_embed"},
+        }
+    if not alt:
+        alt = Path(filename).stem or "image"
+
+    width: int | None = None
+    height: int | None = None
+    for option in options:
+        if "=" not in option:
+            continue
+        key, value = option.split("=", 1)
+        parsed = _parse_dimension_option(value)
+        if parsed is None:
+            continue
+        if key.strip().lower() == "width":
+            width = parsed
+        elif key.strip().lower() == "height":
+            height = parsed
+
+    safe_filename = quote(filename.replace("\\", "/"))
+    attrs: dict[str, object] = {
+        "url": f"/img/{safe_filename}",
+        "alt": alt,
+    }
+    if width is not None:
+        attrs["width"] = width
+    if height is not None:
+        attrs["height"] = height
+    return {
+        "type": "image",
+        "children": [{"type": "text", "raw": alt}],
+        "attrs": attrs,
+    }
+
+
 def _parse_callout(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
     raw_lines = [line for line in match.group(0).splitlines() if line.strip()]
     bodies: list[str] = []
@@ -606,11 +773,26 @@ def _parse_callout(block: mistune.BlockParser, match: Match[str], state: BlockSt
         if level and current_level != level:
             return None
         level = current_level
-        bodies.append(html.escape(line_match.group("callout_body").strip()))
+        bodies.append(line_match.group("callout_body").strip())
     if not level or not bodies:
         return None
 
-    state.append_token({"type": "callout", "raw": "<br>\n".join(bodies), "attrs": {"level": level}})
+    if _is_ast_rendering(state.env):
+        state.append_token(
+            {
+                "type": "callout",
+                "attrs": {"level": level, "lines": bodies},
+            }
+        )
+        return match.end()
+
+    state.append_token(
+        {
+            "type": "callout",
+            "raw": "<br>\n".join(html.escape(body) for body in bodies),
+            "attrs": {"level": level},
+        }
+    )
     return match.end()
 
 
@@ -622,10 +804,16 @@ def _parse_template_block(md: Markdown, block: mistune.BlockParser, match: Match
         return None
     toc_max_level = toc_max_level_from_ref(ref)
     if toc_max_level is not None:
-        state.append_token({"type": "toc", "attrs": {"max_level": toc_max_level}})
+        attrs: dict[str, object] = {"max_level": toc_max_level}
+        if _is_ast_rendering(state.env):
+            attrs["inline"] = False
+        state.append_token({"type": "toc", "attrs": attrs})
         return state.find_line_end()
     rendered = _render_template_ref(md, state.env, ref)
-    state.append_token({"type": "template_block", "raw": rendered})
+    token: dict[str, object] = {"type": "template_block", "raw": rendered}
+    if _is_ast_rendering(state.env):
+        token["attrs"] = {"ref": ref, "inline": False}
+    state.append_token(token)
     return state.find_line_end()
 
 
@@ -641,12 +829,31 @@ def _parse_folded_template_block(
     if not ref:
         return None
     rendered = _render_template_ref(md, state.env, ref)
-    state.append_token({"type": "folded_template_block", "raw": rendered, "attrs": {"ref": ref}})
+    attrs: dict[str, object] = {"ref": ref}
+    if _is_ast_rendering(state.env):
+        attrs["inline"] = False
+    state.append_token({"type": "folded_template_block", "raw": rendered, "attrs": attrs})
     return state.find_line_end()
 
 
 def _parse_raw_image_block(block: mistune.BlockParser, match: Match[str], state: BlockState) -> int | None:
     raw = match.group("raw_image_block_value").strip()
+    if _is_ast_rendering(state.env):
+        context = _get_context(state.env)
+        tag_embed = _parse_tag_embed_ast(raw, context)
+        if tag_embed is not None:
+            state.append_token(tag_embed)
+            return state.find_line_end()
+        parsed = _parse_image_shortcut_ast(raw)
+        if parsed["type"] == "image" and not (
+            parsed.get("attrs", {}).get("width") or parsed.get("attrs", {}).get("height")
+        ):
+            # Keep plain block images on Mistune's normal inline path so the
+            # AST has the same paragraph wrapper as the HTML renderer.
+            return None
+        state.append_token(parsed)
+        return state.find_line_end()
+
     tag_embed = _render_tag_embed(raw, _get_context(state.env))
     if tag_embed is not None:
         state.append_token({"type": "raw_embed", "raw": tag_embed})
@@ -702,18 +909,31 @@ def _parse_wiki_link(inline: mistune.InlineParser, match: Match[str], state: Inl
 
     child = state.copy()
     child.src = label
-    state.append_token(
-        {
-            "type": "link",
-            "children": inline.render(child),
-            "attrs": {"url": url},
-        }
-    )
+    attrs: dict[str, object] = {"url": url}
+    if _is_ast_rendering(state.env):
+        if _is_file_wiki_target(target):
+            attrs["kind"] = "file"
+        elif _is_external_wiki_target(target):
+            attrs["kind"] = "external"
+        elif url.startswith("/doc/"):
+            attrs["kind"] = "wiki"
+        else:
+            attrs["kind"] = "new_document"
+        attrs["target"] = target
+    state.append_token({"type": "link", "children": inline.render(child), "attrs": attrs})
     return match.end()
 
 
 def _parse_image_shortcut_inline(inline: mistune.InlineParser, match: Match[str], state: InlineState) -> int:
     raw = match.group("image_shortcut_value").strip()
+    if _is_ast_rendering(state.env):
+        tag_embed = _parse_tag_embed_ast(raw, _get_context(state.env))
+        if tag_embed is not None:
+            state.append_token(tag_embed)
+            return match.end()
+        state.append_token(_parse_image_shortcut_ast(raw))
+        return match.end()
+
     tag_embed = _render_tag_embed(raw, _get_context(state.env))
     if tag_embed is not None:
         state.append_token({"type": "raw_embed", "raw": tag_embed})
@@ -740,10 +960,16 @@ def _parse_template_inline(md: Markdown, inline: mistune.InlineParser, match: Ma
         return None
     toc_max_level = toc_max_level_from_ref(ref)
     if toc_max_level is not None:
-        state.append_token({"type": "toc", "attrs": {"max_level": toc_max_level}})
+        attrs: dict[str, object] = {"max_level": toc_max_level}
+        if _is_ast_rendering(state.env):
+            attrs["inline"] = True
+        state.append_token({"type": "toc", "attrs": attrs})
         return match.end()
     rendered = _render_template_ref(md, state.env, ref)
-    state.append_token({"type": "template_inline", "raw": rendered})
+    token: dict[str, object] = {"type": "template_inline", "raw": rendered}
+    if _is_ast_rendering(state.env):
+        token["attrs"] = {"ref": ref, "inline": True}
+    state.append_token(token)
     return match.end()
 
 
@@ -759,7 +985,10 @@ def _parse_folded_template_inline(
     if not ref:
         return None
     rendered = _render_template_ref(md, state.env, ref)
-    state.append_token({"type": "folded_template_block", "raw": rendered, "attrs": {"ref": ref}})
+    attrs: dict[str, object] = {"ref": ref}
+    if _is_ast_rendering(state.env):
+        attrs["inline"] = True
+    state.append_token({"type": "folded_template_block", "raw": rendered, "attrs": attrs})
     return match.end()
 
 
@@ -935,11 +1164,317 @@ def personal_wiki_syntax(md: Markdown) -> None:
     )
 
 
+def _json_safe_value(value: object) -> object:
+    """Convert parser values to the JSON primitives exposed to native clients."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _ast_plain_text(nodes: list[dict[str, object]]) -> str:
+    parts: list[str] = []
+    for node in nodes:
+        node_type = str(node.get("type", ""))
+        attrs = node.get("attrs", {})
+        if node_type == "image" and isinstance(attrs, dict):
+            alt = attrs.get("alt")
+            if alt:
+                parts.append(str(alt))
+        text = node.get("text")
+        if text:
+            parts.append(str(text))
+        children = node.get("children", [])
+        if isinstance(children, list):
+            child_nodes = [child for child in children if isinstance(child, dict)]
+            parts.append(_ast_plain_text(child_nodes))
+    return "".join(parts)
+
+
+def _safe_ast_url(url: str) -> str:
+    """Return a URL safe for the native client's non-browser link actions.
+
+    The HTML renderer still follows Mistune's browser-oriented URL rules.  A
+    native client is different: handing a URI to Windows can activate a
+    protocol handler such as ``ms-settings:`` or ``shell:``, so only normal
+    web URLs and scheme-free PersonalWiki paths cross this boundary.
+    """
+    source = str(url or "")
+    decoded = source
+    for _ in range(3):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+
+    normalized = decoded.strip()
+    # Percent-encoded control characters are a common way to disguise a
+    # dangerous scheme.  They are never meaningful in a client action URL.
+    if not normalized or any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        return "#harmful-link"
+
+    parsed = urlsplit(normalized)
+    if parsed.scheme:
+        scheme = parsed.scheme.casefold()
+        if scheme not in AST_SAFE_EXTERNAL_SCHEMES or not parsed.netloc:
+            return "#harmful-link"
+    elif normalized.startswith(("//", "\\\\")):
+        # Do not allow a protocol-relative or UNC path to bypass the scheme
+        # allowlist when the client evaluates a link click.
+        return "#harmful-link"
+
+    return source
+
+
+class PersonalWikiAstSerializer:
+    """Serialize Mistune tokens to the stable, JSON-safe native render tree.
+
+    Every returned node has ``type``, ``text``, ``children`` and ``attrs``.
+    ``text`` is plain source text only; HTML is never parsed back into nodes.
+    """
+
+    _TYPE_ALIASES = {
+        "template_block": "template",
+        "template_inline": "template",
+        "folded_template_block": "template",
+        "raw_embed": "html",
+        "inline_html": "html",
+        "block_html": "html",
+        "block_error": "error",
+    }
+
+    def __init__(self) -> None:
+        self._heading_id_counts: dict[str, int] = {}
+        self._headings: list[dict[str, object]] = []
+
+    def serialize(self, tokens: list[dict[str, object]]) -> list[dict[str, object]]:
+        nodes = self._serialize_tokens(tokens)
+        self._populate_toc_nodes(nodes)
+        return nodes
+
+    def _serialize_tokens(self, tokens: object) -> list[dict[str, object]]:
+        if not isinstance(tokens, list):
+            return []
+        nodes: list[dict[str, object]] = []
+        for token in tokens:
+            if isinstance(token, dict):
+                nodes.append(self._serialize_token(token))
+        return nodes
+
+    def _serialize_token(self, token: dict[str, object]) -> dict[str, object]:
+        source_type = str(token.get("type", "unknown"))
+        node_type = self._TYPE_ALIASES.get(source_type, source_type)
+        attrs = self._serialize_attrs(token.get("attrs"))
+        for key in ("tight", "bullet", "style"):
+            if key in token:
+                attrs.setdefault(key, _json_safe_value(token[key]))
+
+        text = ""
+        children: list[dict[str, object]] = []
+        if "children" in token:
+            children = self._serialize_tokens(token["children"])
+        elif "raw" in token:
+            raw = token["raw"]
+            if isinstance(raw, list):
+                children = self._serialize_tokens(raw)
+            elif raw is not None:
+                text = str(raw)
+        elif "text" in token and token["text"] is not None:
+            text = str(token["text"])
+
+        if source_type in {"template_block", "template_inline", "folded_template_block"}:
+            attrs["folded"] = source_type == "folded_template_block"
+            attrs.setdefault("inline", source_type == "template_inline")
+        elif source_type in {"inline_html", "block_html", "raw_embed"}:
+            attrs["inline"] = source_type == "inline_html"
+            attrs["trusted"] = False
+            attrs["render_mode"] = "literal"
+
+        if node_type in {"link", "image", "youtube"} and isinstance(attrs.get("url"), str):
+            attrs["url"] = _safe_ast_url(str(attrs["url"]))
+        if node_type == "image":
+            attrs.setdefault("alt", _ast_plain_text(children))
+        if node_type == "callout":
+            lines = attrs.get("lines")
+            if isinstance(lines, list):
+                text = "\n".join(str(line) for line in lines)
+            level = str(attrs.get("level", "note"))
+            icon, label = CALLOUT_ICONS.get(level, ("i", level))
+            attrs["icon"] = icon
+            attrs["label"] = label
+        if node_type == "tag_embed":
+            children = self._tag_embed_children(attrs)
+        children = self._normalize_documented_inline_html(children)
+        if node_type == "heading":
+            self._assign_heading_attrs(attrs, children)
+
+        return {
+            "type": node_type,
+            "text": text,
+            "children": children,
+            "attrs": attrs,
+        }
+
+    @staticmethod
+    def _serialize_attrs(raw_attrs: object) -> dict[str, object]:
+        if not isinstance(raw_attrs, dict):
+            return {}
+        return {
+            str(key): _json_safe_value(value)
+            for key, value in raw_attrs.items()
+        }
+
+    def _assign_heading_attrs(self, attrs: dict[str, object], children: list[dict[str, object]]) -> None:
+        try:
+            level = int(attrs.get("level", 1))
+        except (TypeError, ValueError):
+            level = 1
+        level = min(max(level, 1), 6)
+        title = re.sub(r"\s+", " ", html.unescape(_ast_plain_text(children))).strip()
+        requested_id = str(attrs.get("id") or "").strip()
+        anchor = requested_id or self._unique_heading_anchor(title)
+        attrs["level"] = level
+        attrs["anchor"] = anchor
+        if title:
+            self._headings.append({"level": level, "title": title, "anchor": anchor})
+
+    def _unique_heading_anchor(self, title: str) -> str:
+        base = _heading_anchor_base(title)
+        count = self._heading_id_counts.get(base, 0) + 1
+        self._heading_id_counts[base] = count
+        if count == 1:
+            return base
+        return f"{base}-{count}"
+
+    def _tag_embed_children(self, attrs: dict[str, object]) -> list[dict[str, object]]:
+        documents = attrs.get("documents")
+        if not isinstance(documents, list):
+            return []
+        children: list[dict[str, object]] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+            title = str(document.get("title", ""))
+            url = _safe_ast_url(str(document.get("url", "")))
+            children.append(
+                {
+                    "type": "link",
+                    "text": title,
+                    "children": [],
+                    "attrs": {
+                        "url": url,
+                        "kind": "wiki",
+                        "target": title,
+                    },
+                }
+            )
+        return children
+
+    @staticmethod
+    def _is_inline_html(node: dict[str, object], pattern: re.Pattern[str]) -> bool:
+        attrs = node.get("attrs")
+        return (
+            node.get("type") == "html"
+            and isinstance(attrs, dict)
+            and attrs.get("inline") is True
+            and pattern.fullmatch(str(node.get("text", ""))) is not None
+        )
+
+    @classmethod
+    def _normalize_documented_inline_html(
+        cls,
+        nodes: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Map the small documented HTML allowlist to native render nodes.
+
+        Raw HTML stays literal and untrusted.  ``<br>`` and paired ``<kbd>``
+        are documented PersonalWiki conveniences, however, so represent them
+        structurally rather than making the native client parse arbitrary HTML.
+        """
+        normalized: list[dict[str, object]] = []
+        index = 0
+        while index < len(nodes):
+            node = nodes[index]
+            if cls._is_inline_html(node, AST_BR_HTML_RE):
+                normalized.append(
+                    {
+                        "type": "linebreak",
+                        "text": "",
+                        "children": [],
+                        "attrs": {"source": "html_br"},
+                    }
+                )
+                index += 1
+                continue
+
+            if not cls._is_inline_html(node, AST_KBD_OPEN_HTML_RE):
+                normalized.append(node)
+                index += 1
+                continue
+
+            depth = 1
+            closing_index: int | None = None
+            cursor = index + 1
+            while cursor < len(nodes):
+                candidate = nodes[cursor]
+                if cls._is_inline_html(candidate, AST_KBD_OPEN_HTML_RE):
+                    depth += 1
+                elif cls._is_inline_html(candidate, AST_KBD_CLOSE_HTML_RE):
+                    depth -= 1
+                    if depth == 0:
+                        closing_index = cursor
+                        break
+                cursor += 1
+
+            # Do not reinterpret malformed markup.  Leaving it as literal
+            # text matches the native client's safe raw-HTML behavior.
+            if closing_index is None:
+                normalized.append(node)
+                index += 1
+                continue
+
+            normalized.append(
+                {
+                    "type": "kbd",
+                    "text": "",
+                    "children": cls._normalize_documented_inline_html(nodes[index + 1 : closing_index]),
+                    "attrs": {"source": "html_kbd"},
+                }
+            )
+            index = closing_index + 1
+
+        return normalized
+
+    def _populate_toc_nodes(self, nodes: list[dict[str, object]]) -> None:
+        for node in nodes:
+            if node["type"] == "toc":
+                attrs = node["attrs"]
+                if isinstance(attrs, dict):
+                    try:
+                        max_level = int(attrs.get("max_level", TOC_DEFAULT_MAX_LEVEL))
+                    except (TypeError, ValueError):
+                        max_level = TOC_DEFAULT_MAX_LEVEL
+                    max_level = min(max(max_level, 1), 6)
+                    attrs["max_level"] = max_level
+                    attrs["headings"] = [
+                        dict(heading)
+                        for heading in self._headings
+                        if int(heading["level"]) <= max_level
+                    ]
+            children = node.get("children", [])
+            if isinstance(children, list):
+                child_nodes = [child for child in children if isinstance(child, dict)]
+                self._populate_toc_nodes(child_nodes)
+
+
 class MarkdownEngine:
     def __init__(self) -> None:
         pass
 
-    def _create_markdown(self, renderer: PersonalWikiRenderer) -> Markdown:
+    def _create_markdown(self, renderer: PersonalWikiRenderer | None) -> Markdown:
         return mistune.create_markdown(
             escape=False,
             renderer=renderer,
@@ -972,3 +1507,30 @@ class MarkdownEngine:
         )
         rendered, _ = markdown.parse(text, state)
         return renderer.render_toc_placeholders(str(rendered))
+
+    def render_ast(
+        self,
+        text: str,
+        *,
+        resolve_doc_reference: Callable[[str], str | None],
+        read_document: Callable[[str], str | None],
+        list_tag_documents: Callable[[str], list[dict[str, object]]],
+    ) -> list[dict[str, object]]:
+        """Return the native-client render tree without serializing any HTML.
+
+        The returned nodes contain only JSON primitives and retain the parsed
+        Markdown structure, including PersonalWiki's embeds and templates.
+        """
+        markdown = self._create_markdown(None)
+        state = markdown.block.state_cls()
+        state.env[WIKI_CONTEXT_KEY] = WikiRenderContext(
+            resolve_doc_reference=resolve_doc_reference,
+            read_document=read_document,
+            list_tag_documents=list_tag_documents,
+        )
+        state.env[AST_RENDERING_KEY] = True
+        parsed, _ = markdown.parse(text, state)
+        if not isinstance(parsed, list):
+            raise RuntimeError("AST markdown parser returned a non-list result")
+        tokens = [token for token in parsed if isinstance(token, dict)]
+        return PersonalWikiAstSerializer().serialize(tokens)

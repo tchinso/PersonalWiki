@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block title %}설정 | Personal Wiki{% endblock %}
+
+{% block content %}
+<section class="panel tool-panel settings-panel">
+  <header class="section-head">
+    <div>
+      <p class="eyebrow">Settings</p>
+      <h1>서버 및 브라우저 설정</h1>
+    </div>
+  </header>
+
+  <p class="muted">
+    이 설정은 PersonalWiki 서버와 웹 브라우저 화면에만 적용됩니다.
+    PersonalWikiClient는 접속 포트와 글꼴을 자체 설정에서 별도로 관리합니다.
+  </p>
+
+  {% if error %}
+    <p class="error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  {% if saved %}
+    <p class="success" role="status">
+      설정을 저장했습니다.
+      {% if restart_required %}
+        포트 변경은 PersonalWiki를 종료한 뒤 다시 시작해야 적용됩니다.
+      {% else %}
+        브라우저 글꼴은 현재 페이지부터 적용됩니다.
+      {% endif %}
+    </p>
+  {% endif %}
+
+  <form method="post" class="settings-form">
+    <section class="settings-group" aria-labelledby="server-settings-title">
+      <h2 id="server-settings-title">서버</h2>
+      <label for="server-port">포트 번호</label>
+      <input
+        id="server-port"
+        name="port"
+        type="number"
+        inputmode="numeric"
+        min="1"
+        max="65535"
+        step="1"
+        value="{{ form_port }}"
+        required
+      >
+      <p class="hint">기본값은 6885입니다. 변경한 포트는 다음 PersonalWiki 서버 시작부터 적용됩니다.</p>
+    </section>
+
+    <section class="settings-group" aria-labelledby="browser-settings-title">
+      <h2 id="browser-settings-title">웹 브라우저</h2>
+      <label for="browser-font">본문 글꼴</label>
+      <select id="browser-font" name="browser_font">
+        {% for font in browser_font_options %}
+          <option value="{{ font.key }}" {% if form_browser_font == font.key %}selected{% endif %}>{{ font.label }}</option>
+        {% endfor %}
+        <option value="custom" {% if form_browser_font == 'custom' %}selected{% endif %}>직접 입력한 글꼴</option>
+      </select>
+
+      <label for="browser-font-custom">직접 입력할 설치 글꼴 이름</label>
+      <input
+        id="browser-font-custom"
+        name="browser_font_custom"
+        type="text"
+        maxlength="80"
+        value="{{ form_browser_font_custom }}"
+        placeholder="예: 맑은 고딕"
+      >
+      <p class="hint">
+        “직접 입력한 글꼴”을 선택한 경우에만 사용합니다. 글꼴명만 입력할 수 있으며, CSS 코드는 사용할 수 없습니다.
+        코드와 Markdown 편집 칸은 가독성을 위해 고정폭 글꼴을 유지합니다.
+      </p>
+    </section>
+
+    <div class="button-row">
+      <button class="button" type="submit">설정 저장</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

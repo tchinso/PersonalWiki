@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="4.152.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="4.152.1" />
+    <Compile Include="..\PersonalWikiClient\Models.cs" Link="Models.cs" />
+    <Compile Include="..\PersonalWikiClient\NativeImageDecoder.cs" Link="NativeImageDecoder.cs" />
+    <Compile Include="..\PersonalWikiClient\NativeMarkdownRenderer.cs" Link="NativeMarkdownRenderer.cs" />
+    <Compile Include="..\PersonalWikiClient\ClipboardImageAttachments.cs" Link="ClipboardImageAttachments.cs" />
+    <None Include="native-renderer-fixture.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\img\strawberry.webp" Link="strawberry.webp" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

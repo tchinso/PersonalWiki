@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import math
 import os
 import re
@@ -9,9 +10,11 @@ import threading
 from collections import Counter, OrderedDict, defaultdict, deque
 from datetime import datetime
 from functools import lru_cache
+from itertools import islice
 
 ENGLISH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{2,}(?![A-Za-z0-9])")
 KOREAN_TOKEN_RE = re.compile(r"[가-힣]{2,}")
+KOREAN_WORD_RE = re.compile(r"[가-힣]+")
 KOREAN_CHAR_RE = re.compile(r"[가-힣]")
 ENGLISH_STOPWORDS = {
     "the",
@@ -112,14 +115,6 @@ KOREAN_STOPWORDS = {
     "내용",
     "그리고",
     "또는",
-    "에서",
-    "으로",
-    "입니다",
-    "있는",
-    "하는",
-    "합니다",
-    "대한",
-    "통해",
     "관련",
     "사용",
     "기능",
@@ -130,19 +125,13 @@ KOREAN_STOPWORDS = {
     "여기",
     "거기",
     "저기",
-    "같은",
     "다른",
     "모든",
     "각각",
     "해당",
     "경우",
     "정도",
-    "위해",
-    "위한",
     "때문",
-    "중에서",
-    "대해서",
-    "대하여",
     "또한",
     "이미",
     "먼저",
@@ -150,7 +139,6 @@ KOREAN_STOPWORDS = {
     "이번",
     "다음",
     "아래",
-    "위의",
     "하지만",
     "그러나",
     "그러면",
@@ -160,9 +148,6 @@ KOREAN_STOPWORDS = {
     "정말",
     "조금",
     "많이",
-    "있습니다",
-    "없습니다",
-    "같습니다",
     "이런",
     "그런",
     "저런",
@@ -193,32 +178,242 @@ KOREAN_STOPWORDS = {
     "불가능",
     "필요",
     "필요한",
-    "있어",
-    "없는",
-    "있고",
-    "없고",
-    "된다",
-    "되는",
-    "하면",
-    "해서",
-    "하고",
-    "한다",
+}
+KOREAN_STOPWORDS_LONGEST_FIRST = tuple(sorted(KOREAN_STOPWORDS, key=lambda word: (-len(word), word)))
+KOREAN_STOPWORD_RE = re.compile("|".join(re.escape(word) for word in KOREAN_STOPWORDS_LONGEST_FIRST))
+
+# These are grammatical particles and surface endings, not ordinary content
+# stopwords.  They must be removed only from the end of each Hangul token.
+# The list is intentionally aggressive: recommendation matching benefits more
+# from a stable shared stem than from preserving every lexical edge case.
+#
+# Keep items that used to be in KOREAN_STOPWORDS here as well as common
+# variants that occur without whitespace (for example, ``전문가이고``).
+KOREAN_ENDING_STOPWORDS = {
+    # Compound particles / postpositions.
+    "으로부터",
+    "으로서는",
+    "으로써",
+    "으로서",
+    "에게서는",
+    "에게서",
+    "한테서는",
+    "한테서",
+    "께서는",
+    "에서는",
+    "로부터",
+    "에게",
+    "한테",
+    "께서",
+    "에서",
+    "으로",
+    "로서",
+    "로써",
+    "대로",
     "처럼",
     "보다",
     "까지",
     "부터",
+    "에게는",
+    "에게도",
+    "한테는",
+    "한테도",
+    "께는",
+    "께도",
+    "에는",
+    "에도",
+    "에선",
+    "밖에",
+    "조차",
+    "마저",
+    "마다",
+    "이라도",
+    "라도",
+    "이랑",
+    "이든지",
+    "든지",
+    "이든",
+    "이나",
+    "과",
+    "와",
+    "의",
+    "에",
+    "로",
+    "은",
+    "는",
+    "이",
+    "가",
     "을",
     "를",
+    "도",
+    "만",
+    "뿐",
+    "나",
+    "랑",
+    "든",
+    # Copula and connective endings.
+    "이었습니다",
+    "이었으면",
+    "이었지만",
+    "이었는데",
+    "이었으며",
+    "이었고",
+    "이었다가",
+    "이었다",
+    "이겠습니다",
+    "이겠지만",
+    "이겠고",
+    "이라면",
+    "이라서",
+    "이어서",
+    "이므로",
+    "이기에",
+    "이지만",
+    "인데",
+    "이며",
+    "이고",
+    "이면",
+    "이다",
+    "이야",
+    "이요",
+    "이죠",
+    "인가요",
+    "인가",
+    "입니다",
+    "입니까",
+    "이에요",
+    "예요",
+    # Frequently attached verbal/adjectival endings.  Existing generic
+    # stopwords are deliberately moved here so their removal is suffix-only.
+    "있었습니다",
+    "있었으면",
+    "있었지만",
+    "있었는데",
+    "있었으며",
+    "있었고",
+    "있었다",
+    "있습니다",
+    "있으면",
+    "있으며",
+    "있는",
+    "있고",
+    "있어",
+    "있다",
+    "있을",
+    "있음",
+    "없었습니다",
+    "없었으면",
+    "없었지만",
+    "없었는데",
+    "없었으며",
+    "없었고",
+    "없었다",
+    "없습니다",
+    "없으면",
+    "없으며",
+    "없는",
+    "없고",
+    "없어",
+    "없다",
+    "없을",
+    "없음",
+    "되었습니다",
+    "되었으면",
+    "되었지만",
+    "되었는데",
+    "되었으며",
+    "되었고",
+    "되었다가",
+    "되었다",
+    "됩니다",
+    "되므로",
+    "으므로",
+    "되어서",
+    "되어",
+    "됐다",
+    "되면",
+    "되고",
+    "되는",
+    "된다",
+    "될",
+    "됨",
+    "하였습니다",
+    "하였으면",
+    "하였지만",
+    "하였는데",
+    "하였으며",
+    "하였고",
+    "하였다가",
+    "하였다",
+    "했습니다",
+    "했으면",
+    "했지만",
+    "했는데",
+    "했으며",
+    "했고",
+    "했다가",
+    "했다",
+    "합니다",
+    "하십시오",
+    "하세요",
+    "하면서",
+    "하거나",
+    "하면",
+    "하며",
+    "하고",
+    "하여",
+    "해서",
+    "하는",
+    "한다",
+    "할",
+    "함",
+    "해요",
+    "해",
+    "같습니다",
+    "같았지만",
+    "같았는데",
+    "같았고",
+    "같았다",
+    "같으면",
+    "같으며",
+    "같은",
+    "같고",
+    "같아",
+    "같다",
+    "같을",
+    "대한",
+    "대해서",
+    "대하여",
+    "위해서",
+    "위해",
+    "위한",
+    "통해서",
+    "통해",
+    "중에서",
+    "위의",
 }
-KOREAN_STOPWORDS_LONGEST_FIRST = tuple(sorted(KOREAN_STOPWORDS, key=lambda word: (-len(word), word)))
-KOREAN_STOPWORD_RE = re.compile("|".join(re.escape(word) for word in KOREAN_STOPWORDS_LONGEST_FIRST))
+KOREAN_ENDING_STOPWORDS_LONGEST_FIRST = tuple(
+    sorted(KOREAN_ENDING_STOPWORDS, key=lambda word: (-len(word), word))
+)
+# Repeated stripping is linear in the number of removed endings: limiting each
+# pass to endings with the same final syllable avoids rescanning a long token.
+KOREAN_ENDING_STOPWORDS_BY_LAST_CHAR: dict[str, tuple[str, ...]] = {
+    final_char: tuple(
+        ending
+        for ending in KOREAN_ENDING_STOPWORDS_LONGEST_FIRST
+        if ending.endswith(final_char)
+    )
+    for final_char in sorted({ending[-1] for ending in KOREAN_ENDING_STOPWORDS})
+}
 
 
 MARKDOWN_EMBED_IGNORE_SPAN_RE = re.compile(
     r"!\[\[[^\]\r\n]*\]\]|!\[[^\]\r\n]*\]\([^\r\n)]*\)"
 )
 
-TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v4-ignore-markdown-embeds-and-tag"
+# v7 bounds token analysis before materializing a Counter, so existing v6
+# indexes must rebuild rather than retaining unbounded-source token rows.
+TAG_RECOMMEND_TOKENIZER_VERSION = "tag-token-v7-korean-suffix-stopwords-bounded-input"
 TAG_RECOMMEND_IDF_EXPONENT = 2.0
 TAG_RECOMMEND_SIMILAR_DOC_LIMIT = 30
 TAG_RECOMMEND_LIMIT = 25
@@ -239,6 +434,26 @@ TAG_RECOMMEND_FULL_SCAN_MAX_DOCS = 1000
 TAG_RECOMMEND_QUERY_VECTOR_MAX_TOKENS = 256
 TAG_RECOMMEND_SCORE_DOC_LIMIT = 750
 TAG_RECOMMEND_CACHE_MAX_ENTRIES = 128
+# An individual natural-language token is ordinarily far shorter than this.
+# Ignoring pathological runs prevents one pasted/generated identifier from
+# becoming a huge cache key or a giant row in the token index.
+TAG_RECOMMEND_MAX_TOKEN_LENGTH = 256
+# Bound the source examined before a Counter is built.  The persisted index
+# retains at most 512/768/1024 content terms anyway, so these generous limits
+# leave ordinary notes unchanged while preventing a generated unique-token
+# stream from consuming unbounded memory and CPU before adaptive pruning.
+TAG_RECOMMEND_MAX_TITLE_ANALYSIS_CHARS = 16_384
+TAG_RECOMMEND_MAX_TITLE_TOKENS = 512
+TAG_RECOMMEND_MAX_CONTENT_ANALYSIS_CHARS = 1_000_000
+TAG_RECOMMEND_MAX_CONTENT_TOKENS = 20_000
+# Both normalizers use LRU caches because common prose repeats words often.
+# Cache only bounded-size keys/values so the cache itself remains lightweight
+# when a document contains an accidentally enormous contiguous word.
+TOKEN_NORMALIZATION_CACHE_MAX_LENGTH = 128
+# A real Korean surface form has only a small stack of particles/endings.  The
+# cap applies solely to oversized tokens; it avoids spending linear work on an
+# artificial run such as "가" repeated millions of times.
+KOREAN_ENDING_MAX_STRIPS_FOR_LONG_TOKEN = 16
 TAG_RECOMMEND_DEBUG = os.environ.get("PERSONALWIKI_TAG_RECOMMEND_DEBUG") == "1"
 SQLITE_IN_CLAUSE_CHUNK_SIZE = 400
 
@@ -702,8 +917,7 @@ def _build_doc_tag_map(conn: sqlite3.Connection, doc_ids: list[int]) -> dict[int
             mapping[int(row["doc_id"])].append(str(row["name"]))
     return dict(mapping)
 
-@lru_cache(maxsize=8192)
-def singularize_token(token: str) -> str:
+def _singularize_token_uncached(token: str) -> str:
     if not token.isascii() or not token.isalpha():
         return token
     if token.endswith("ies") and len(token) > 4:
@@ -717,8 +931,70 @@ def singularize_token(token: str) -> str:
     return token
 
 
+@lru_cache(maxsize=8192)
+def _singularize_token_cached(token: str) -> str:
+    return _singularize_token_uncached(token)
+
+
+def singularize_token(token: str) -> str:
+    """Return a lightweight English singular form without retaining huge keys."""
+    if len(token) > TOKEN_NORMALIZATION_CACHE_MAX_LENGTH:
+        return _singularize_token_uncached(token)
+    return _singularize_token_cached(token)
+
+
 def remove_korean_stopwords_aggressively(text: str) -> str:
     return KOREAN_STOPWORD_RE.sub("", text)
+
+
+def _strip_korean_ending_stopwords_uncached(
+    token: str,
+    *,
+    max_strips: int | None = None,
+) -> str:
+    """Repeatedly remove known grammatical endings from one Hangul token.
+
+    This is intentionally a lightweight suffix normalizer rather than a Korean
+    morphological analyser.  Repeating the longest-first match handles stacked
+    forms such as ``전문가이고`` while keeping particles from being removed in
+    the middle of a word.
+    """
+    end = len(token)
+    removed = 0
+    while end:
+        for ending in KOREAN_ENDING_STOPWORDS_BY_LAST_CHAR.get(token[end - 1], ()):
+            if token.endswith(ending, 0, end):
+                end -= len(ending)
+                removed += 1
+                break
+        else:
+            break
+        if max_strips is not None and removed >= max_strips:
+            break
+    return token if end == len(token) else token[:end]
+
+
+@lru_cache(maxsize=8192)
+def _strip_korean_ending_stopwords_cached(token: str) -> str:
+    return _strip_korean_ending_stopwords_uncached(token)
+
+
+def strip_korean_ending_stopwords(token: str) -> str:
+    """Normalize a Korean token while keeping the LRU cache memory-bounded."""
+    if len(token) > TOKEN_NORMALIZATION_CACHE_MAX_LENGTH:
+        return _strip_korean_ending_stopwords_uncached(
+            token,
+            max_strips=KOREAN_ENDING_MAX_STRIPS_FOR_LONG_TOKEN,
+        )
+    return _strip_korean_ending_stopwords_cached(token)
+
+
+def remove_korean_ending_stopwords_aggressively(text: str) -> str:
+    """Remove Korean particles/endings only at each contiguous word's end."""
+    return KOREAN_WORD_RE.sub(
+        lambda match: strip_korean_ending_stopwords(match.group(0)),
+        text,
+    )
 
 
 def is_low_value_numeric_token(token: str) -> bool:
@@ -743,6 +1019,8 @@ def iter_tokens_from_segment(segment: str):
     lowered = segment.lower()
     for match in ENGLISH_TOKEN_RE.finditer(lowered):
         raw = match.group(0)
+        if len(raw) > TAG_RECOMMEND_MAX_TOKEN_LENGTH:
+            continue
         token = singularize_token(raw)
         if is_low_value_numeric_token(token):
             continue
@@ -752,10 +1030,16 @@ def iter_tokens_from_segment(segment: str):
             continue
         yield token
 
+    # Most English-only notes have no Hangul at all.  Avoid two whole-text
+    # substitutions and a second token scan in that common path.
+    if KOREAN_CHAR_RE.search(lowered) is None:
+        return
+
     korean_cleaned = remove_korean_stopwords_aggressively(lowered)
+    korean_cleaned = remove_korean_ending_stopwords_aggressively(korean_cleaned)
     for match in KOREAN_TOKEN_RE.finditer(korean_cleaned):
         token = match.group(0)
-        if len(token) < 2:
+        if len(token) < 2 or len(token) > TAG_RECOMMEND_MAX_TOKEN_LENGTH:
             continue
         yield token
 
@@ -774,6 +1058,26 @@ def tokenize_text(text: str) -> list[str]:
     return list(iter_text_tokens(text))
 
 
+def count_bounded_text_tokens(
+    text: str,
+    *,
+    max_chars: int,
+    max_tokens: int,
+) -> Counter[str]:
+    """Count a bounded prefix without materializing an unbounded token list.
+
+    Both bounds are intentionally applied before ``Counter`` receives tokens:
+    ``max_chars`` contains regex/substitution work even for input with no
+    usable tokens, while ``max_tokens`` contains the number of unique keys
+    retained for a high-entropy generated document.  Normal documents stay
+    below these deliberately generous limits and retain their exact behavior.
+    """
+    if not text or max_chars <= 0 or max_tokens <= 0:
+        return Counter()
+    bounded_text = text if len(text) <= max_chars else text[:max_chars]
+    return Counter(islice(iter_text_tokens(bounded_text), max_tokens))
+
+
 def compute_tag_recommendation_idf(total_docs: int, df: int) -> float:
     if total_docs <= 0:
         return 0.0
@@ -788,6 +1092,17 @@ def tag_recommend_token_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
 
 
 def sorted_tf_items(tf_counter: Counter[str], limit: int | None = None) -> list[tuple[str, int]]:
+    if limit is not None and limit <= 0:
+        return []
+    # A normal note has far fewer unique terms than this threshold, where a
+    # full sort is faster.  For a generated/very large note, retain only the
+    # requested prefix instead of allocating and sorting the full vocabulary.
+    if limit is not None and len(tf_counter) > limit * 12:
+        return heapq.nsmallest(
+            limit,
+            tf_counter.items(),
+            key=tag_recommend_token_sort_key,
+        )
     items = sorted(tf_counter.items(), key=tag_recommend_token_sort_key)
     if limit is not None:
         return items[:limit]
@@ -800,12 +1115,7 @@ def limit_tf_counter(tf_counter: Counter[str], max_tokens: int) -> Counter[str]:
     return Counter(dict(sorted_tf_items(tf_counter, max_tokens)))
 
 
-def choose_content_token_limit(tf_counter: Counter[str]) -> int:
-    if not tf_counter:
-        return TAG_RECOMMEND_MIN_TOKENS_PER_DOC
-
-    ranked = sorted_tf_items(tf_counter, TAG_RECOMMEND_MAX_TOKENS_PER_DOC)
-
+def _choose_content_token_limit_from_ranked(ranked: list[tuple[str, int]]) -> int:
     max_index = TAG_RECOMMEND_ADAPTIVE_MAX_INDEX - 1
     if (
         len(ranked) > max_index
@@ -823,20 +1133,41 @@ def choose_content_token_limit(tf_counter: Counter[str]) -> int:
     return TAG_RECOMMEND_MIN_TOKENS_PER_DOC
 
 
+def choose_content_token_limit(tf_counter: Counter[str]) -> int:
+    if not tf_counter:
+        return TAG_RECOMMEND_MIN_TOKENS_PER_DOC
+    ranked = sorted_tf_items(tf_counter, TAG_RECOMMEND_MAX_TOKENS_PER_DOC)
+    return _choose_content_token_limit_from_ranked(ranked)
+
+
 def limit_tf_counter_adaptive(tf_counter: Counter[str]) -> Counter[str]:
     if not tf_counter:
         return tf_counter
 
-    limit = choose_content_token_limit(tf_counter)
+    # The limit decision already requires the top 1,024 terms.  Reuse that
+    # ranked prefix instead of sorting the same Counter again for the final
+    # 512/768/1,024-term index payload.
+    ranked = sorted_tf_items(tf_counter, TAG_RECOMMEND_MAX_TOKENS_PER_DOC)
+    limit = _choose_content_token_limit_from_ranked(ranked)
     if limit <= 0 or len(tf_counter) <= limit:
         return tf_counter
 
-    return Counter(dict(sorted_tf_items(tf_counter, limit)))
+    return Counter(dict(ranked[:limit]))
 
 
 def compute_doc_token_counters(title: str, content: str) -> dict[str, Counter[str]]:
-    title_counter = Counter(iter_text_tokens(title))
-    content_counter = limit_tf_counter_adaptive(Counter(iter_text_tokens(content)))
+    title_counter = count_bounded_text_tokens(
+        title,
+        max_chars=TAG_RECOMMEND_MAX_TITLE_ANALYSIS_CHARS,
+        max_tokens=TAG_RECOMMEND_MAX_TITLE_TOKENS,
+    )
+    content_counter = limit_tf_counter_adaptive(
+        count_bounded_text_tokens(
+            content,
+            max_chars=TAG_RECOMMEND_MAX_CONTENT_ANALYSIS_CHARS,
+            max_tokens=TAG_RECOMMEND_MAX_CONTENT_TOKENS,
+        )
+    )
     return {
         "title": title_counter,
         "content": content_counter,
@@ -855,27 +1186,22 @@ def ensure_language_token_tables(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # A single covering index serves candidate lookup and scoring.  The former
+    # token-only, token/tf, and token/doc indexes had overlapping left prefixes
+    # yet all had to be updated for every indexed term.
+    for legacy_index in (
+        "idx_language_doc_tokens_token",
+        "idx_language_doc_tokens_token_tf",
+        "idx_language_doc_tokens_token_doc",
+        "idx_language_doc_tokens_doc_id",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {legacy_index}")
     conn.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token
-        ON language_doc_tokens(token)
+        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token_doc_tf
+        ON language_doc_tokens(token, doc_id, tf)
         """
     )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token_tf
-        ON language_doc_tokens(token, tf DESC)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_language_doc_tokens_token_doc
-        ON language_doc_tokens(token, doc_id)
-        """
-    )
-    # The primary key starts with doc_id, so this legacy secondary index only
-    # adds B-tree work during every token update.
-    conn.execute("DROP INDEX IF EXISTS idx_language_doc_tokens_doc_id")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS language_doc_norms (
@@ -1132,6 +1458,8 @@ def _get_doc_ids_for_tokens(conn: sqlite3.Connection, tokens: set[str]) -> set[i
 def _recompute_language_doc_norms_for_docs(
     conn: sqlite3.Connection,
     doc_ids: set[int] | list[int],
+    *,
+    update_meta: bool = True,
 ) -> None:
     unique_doc_ids = sorted(set(int(doc_id) for doc_id in doc_ids))
     if not unique_doc_ids:
@@ -1186,14 +1514,22 @@ def _recompute_language_doc_norms_for_docs(
                 f"DELETE FROM language_doc_norms WHERE doc_id IN ({placeholders})",
                 list(chunk),
             )
-    _set_language_doc_norm_count(conn)
+    if update_meta:
+        _set_language_doc_norm_count(conn)
 
 
 def _recompute_all_language_doc_norms(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("SELECT DISTINCT doc_id FROM language_doc_tokens ORDER BY doc_id").fetchall()
-    doc_ids = [int(row["doc_id"]) for row in rows]
     conn.execute("DELETE FROM language_doc_norms")
-    _recompute_language_doc_norms_for_docs(conn, doc_ids)
+    # Stream source IDs rather than materializing the complete corpus during a
+    # startup rebuild.  Each norm query stays within SQLite's parameter limit
+    # and metadata is counted once after the final batch.
+    cursor = conn.execute("SELECT DISTINCT doc_id FROM language_doc_tokens ORDER BY doc_id")
+    while rows := cursor.fetchmany(SQLITE_IN_CLAUSE_CHUNK_SIZE):
+        _recompute_language_doc_norms_for_docs(
+            conn,
+            [int(row["doc_id"]) for row in rows],
+            update_meta=False,
+        )
     _set_language_doc_norm_count(conn)
 
 
@@ -1313,8 +1649,7 @@ def rebuild_language_token_index(
     token_conn.execute("DELETE FROM language_doc_tokens")
     token_conn.execute("DELETE FROM language_token_stats")
 
-    doc_rows = main_conn.execute("SELECT id, title FROM docs ORDER BY id").fetchall()
-    total_docs = len(doc_rows)
+    total_docs = _get_main_doc_count(main_conn)
     pending_rows: list[tuple[int, str, int, str]] = []
 
     def flush_pending_rows() -> None:
@@ -1330,7 +1665,10 @@ def rebuild_language_token_index(
         )
         pending_rows = []
 
-    for chunk in _chunked(doc_rows):
+    # Do not retain every title/row while rebuilding a large wiki.  Content is
+    # already fetched in bounded chunks from the separate FTS database.
+    doc_cursor = main_conn.execute("SELECT id, title FROM docs ORDER BY id")
+    while chunk := doc_cursor.fetchmany(SQLITE_IN_CLAUSE_CHUNK_SIZE):
         doc_ids = [int(row["id"]) for row in chunk]
         placeholders = ",".join("?" for _ in doc_ids)
         content_by_id: dict[int, str] = {}

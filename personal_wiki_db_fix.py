@@ -31,7 +31,12 @@ FTS_DB_PATH = DATA_DIR / "wiki_fts.db"
 TOKEN_DB_PATH = DATA_DIR / "wiki_token.db"
 DATA_LOCK_PATH = DATA_DIR / "wiki.lock"
 _DATA_LOCK_FILE = None
-DB_FIX_PARENT_LOCK_ENV = "PERSONALWIKI_DB_FIX_PARENT_LOCK_HELD"
+SQLITE_MAIN_SYNCHRONOUS = "FULL"
+SQLITE_DERIVED_SYNCHRONOUS = "NORMAL"
+STAGED_DOCUMENT_ASSET_RE = re.compile(
+    r"^\.[^.].*\.(?:edit|delete)-\d+-\d+\.(?:tmp|stage)$",
+    flags=re.IGNORECASE,
+)
 
 
 def iso_from_timestamp(timestamp: float) -> str:
@@ -83,6 +88,11 @@ def cleanup_stale_temp_files() -> int:
         if not directory.exists():
             continue
         for path in directory.glob(".*.tmp"):
+            # Legacy server versions used .tmp for staged edit/delete assets.
+            # A DBFix run must never erase a possibly sole source document.
+            if STAGED_DOCUMENT_ASSET_RE.fullmatch(path.name):
+                print(f"[WARN] preserving staged document asset for recovery: {path}")
+                continue
             try:
                 if path.is_file():
                     path.unlink()
@@ -262,7 +272,18 @@ def release_data_lock() -> None:
     handle.close()
 
 
-def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool) -> None:
+def configure_sqlite_connection(
+    conn: sqlite3.Connection,
+    *,
+    foreign_keys: bool,
+    synchronous: str,
+) -> None:
+    if synchronous == SQLITE_MAIN_SYNCHRONOUS:
+        conn.execute("PRAGMA synchronous = FULL")
+    elif synchronous == SQLITE_DERIVED_SYNCHRONOUS:
+        conn.execute("PRAGMA synchronous = NORMAL")
+    else:
+        raise ValueError(f"Unsupported SQLite synchronous mode: {synchronous}")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA temp_store = MEMORY")
     conn.execute("PRAGMA cache_size = -20000")
@@ -271,10 +292,44 @@ def configure_sqlite_connection(conn: sqlite3.Connection, *, foreign_keys: bool)
         conn.execute("PRAGMA foreign_keys = ON")
 
 
-def connect_db(path: Path) -> sqlite3.Connection:
+def configure_sqlite_storage(conn: sqlite3.Connection) -> None:
+    """Match the server's durable WAL storage layout for rebuilt databases."""
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 1000")
+
+
+def checkpoint_database_for_swap(conn: sqlite3.Connection) -> None:
+    """Flush a temporary WAL before its base database file is swapped in.
+
+    ``replace_databases_from_temp`` deliberately moves only the base ``.db``
+    files.  A clean connection close normally checkpoints WAL, but relying on
+    that implicit behavior could discard an uncheckpointed rebuild after a
+    busy/failed close.  Refuse the swap unless the explicit checkpoint finishes.
+    """
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if row is None:
+        raise RuntimeError("WAL checkpoint returned no status")
+    busy, log_frames, checkpointed_frames = (int(row[index]) for index in range(3))
+    if busy or log_frames != checkpointed_frames:
+        raise RuntimeError(
+            "temporary database WAL checkpoint did not complete "
+            f"(busy={busy}, log={log_frames}, checkpointed={checkpointed_frames})"
+        )
+
+
+def connect_db(
+    path: Path,
+    *,
+    foreign_keys: bool = True,
+    synchronous: str = SQLITE_MAIN_SYNCHRONOUS,
+) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    configure_sqlite_connection(conn, foreign_keys=True)
+    configure_sqlite_connection(
+        conn,
+        foreign_keys=foreign_keys,
+        synchronous=synchronous,
+    )
     return conn
 
 
@@ -539,21 +594,121 @@ def remove_sqlite_family(path: Path) -> None:
             related.unlink()
 
 
-def move_existing_sqlite_family(path: Path, backup_dir: Path) -> list[tuple[Path, Path]]:
-    moved: list[tuple[Path, Path]] = []
+def database_family_paths() -> tuple[Path, Path, Path]:
+    return DB_PATH, FTS_DB_PATH, TOKEN_DB_PATH
+
+
+def swap_manifest_path() -> Path:
+    return DATA_DIR / "wiki.db-swap-recovery.json"
+
+
+def write_swap_manifest(backup_dir: Path, *, phase: str) -> None:
+    if phase not in {"moving_old", "installing_new"}:
+        raise ValueError(f"Unsupported database swap phase: {phase}")
+    write_text_atomic(
+        swap_manifest_path(),
+        json.dumps(
+            {
+                "version": 1,
+                "backup_dir": backup_dir.name,
+                "phase": phase,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
+def read_swap_manifest() -> tuple[Path, str] | None:
+    manifest_path = swap_manifest_path()
+    if not manifest_path.exists():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("database swap recovery manifest is unreadable") from error
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError("database swap recovery manifest has an unsupported format")
+
+    backup_name = payload.get("backup_dir")
+    phase = payload.get("phase")
+    if not isinstance(backup_name, str) or Path(backup_name).name != backup_name:
+        raise RuntimeError("database swap recovery manifest has an invalid backup path")
+    if phase not in {"moving_old", "installing_new"}:
+        raise RuntimeError("database swap recovery manifest has an invalid phase")
+
+    backup_root = (DATA_DIR / "db_backups").resolve()
+    backup_dir = (backup_root / backup_name).resolve()
+    if backup_dir.parent != backup_root or not backup_dir.is_dir():
+        raise RuntimeError("database swap backup directory is unavailable")
+    return backup_dir, phase
+
+
+def move_existing_sqlite_family(path: Path, backup_dir: Path) -> None:
     for related in sqlite_related_paths(path):
-        if not related.exists():
-            continue
-        target = backup_dir / related.name
-        related.replace(target)
-        moved.append((target, related))
-    return moved
+        if related.exists():
+            related.replace(backup_dir / related.name)
 
 
-def restore_sqlite_backups(moved: list[tuple[Path, Path]]) -> None:
-    for backup, original in reversed(moved):
-        if backup.exists() and not original.exists():
-            backup.replace(original)
+def _remove_sqlite_family_best_effort(path: Path, errors: list[str]) -> None:
+    for related in sqlite_related_paths(path):
+        try:
+            if related.exists():
+                related.unlink()
+        except OSError as error:
+            errors.append(f"could not remove {related.name}: {error}")
+
+
+def recover_incomplete_database_swap() -> bool:
+    """Roll back a crash-interrupted three-database swap from its backup.
+
+    SQLite file-family replacement cannot be one filesystem transaction.  The
+    manifest is written before the old files move and survives a process/power
+    failure.  During installation we prefer the prior complete family over a
+    potentially mixed new/old set; document markdown remains the canonical
+    source and DBFix will rebuild a fresh set immediately afterwards.
+    """
+    manifest = read_swap_manifest()
+    if manifest is None:
+        return False
+    backup_dir, phase = manifest
+    errors: list[str] = []
+
+    if phase == "installing_new":
+        for path in database_family_paths():
+            has_backup = any((backup_dir / related.name).exists() for related in sqlite_related_paths(path))
+            if has_backup:
+                _remove_sqlite_family_best_effort(path, errors)
+
+    for path in database_family_paths():
+        for original in sqlite_related_paths(path):
+            backup = backup_dir / original.name
+            if not backup.exists() or original.exists():
+                continue
+            try:
+                backup.replace(original)
+            except OSError as error:
+                errors.append(f"could not restore {original.name}: {error}")
+
+    if errors:
+        raise RuntimeError(
+            "database swap recovery is incomplete; retained manifest and backup: "
+            + "; ".join(errors)
+        )
+
+    try:
+        swap_manifest_path().unlink(missing_ok=True)
+    except OSError as error:
+        raise RuntimeError("database swap recovered but manifest cleanup failed") from error
+    return True
+
+
+def ensure_temp_database_families_are_checkpointed(paths: tuple[Path, Path, Path]) -> None:
+    for path in paths:
+        remaining = [related.name for related in sqlite_related_paths(path)[1:] if related.exists()]
+        if remaining:
+            raise RuntimeError(
+                f"temporary database still has uncheckpointed sidecars: {', '.join(remaining)}"
+            )
 
 
 def replace_databases_from_temp(temp_main: Path, temp_fts: Path, temp_token: Path) -> Path:
@@ -561,30 +716,28 @@ def replace_databases_from_temp(temp_main: Path, temp_fts: Path, temp_token: Pat
     backup_root.mkdir(parents=True, exist_ok=True)
     backup_dir = backup_root / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex}"
     backup_dir.mkdir(exist_ok=False)
-    moved: list[tuple[Path, Path]] = []
-    replaced: list[Path] = []
+    temp_paths = (temp_main, temp_fts, temp_token)
+    destination_paths = database_family_paths()
+    ensure_temp_database_families_are_checkpointed(temp_paths)
+    write_swap_manifest(backup_dir, phase="moving_old")
 
     try:
-        moved.extend(move_existing_sqlite_family(DB_PATH, backup_dir))
-        moved.extend(move_existing_sqlite_family(FTS_DB_PATH, backup_dir))
-        moved.extend(move_existing_sqlite_family(TOKEN_DB_PATH, backup_dir))
+        for path in destination_paths:
+            move_existing_sqlite_family(path, backup_dir)
 
-        temp_main.replace(DB_PATH)
-        replaced.append(DB_PATH)
-        temp_fts.replace(FTS_DB_PATH)
-        replaced.append(FTS_DB_PATH)
-        temp_token.replace(TOKEN_DB_PATH)
-        replaced.append(TOKEN_DB_PATH)
+        write_swap_manifest(backup_dir, phase="installing_new")
+        for source, destination in zip(temp_paths, destination_paths):
+            source.replace(destination)
 
-        remove_sqlite_family(temp_main)
-        remove_sqlite_family(temp_fts)
-        remove_sqlite_family(temp_token)
+        swap_manifest_path().unlink(missing_ok=True)
         return backup_dir
-    except Exception:
-        for path in replaced:
-            if path.exists():
-                path.unlink()
-        restore_sqlite_backups(moved)
+    except BaseException as error:
+        try:
+            recover_incomplete_database_swap()
+        except Exception as recovery_error:
+            raise RuntimeError(
+                "database swap failed and rollback needs recovery on the next DBFix run"
+            ) from recovery_error
         raise
 
 
@@ -595,9 +748,23 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
 
     with (
         closing(connect_db(main_db_path)) as main_conn,
-        closing(connect_db(fts_db_path)) as fts_conn,
-        closing(connect_db(token_db_path)) as token_conn,
+        closing(
+            connect_db(
+                fts_db_path,
+                foreign_keys=False,
+                synchronous=SQLITE_DERIVED_SYNCHRONOUS,
+            )
+        ) as fts_conn,
+        closing(
+            connect_db(
+                token_db_path,
+                foreign_keys=False,
+                synchronous=SQLITE_DERIVED_SYNCHRONOUS,
+            )
+        ) as token_conn,
     ):
+        for connection in (main_conn, fts_conn, token_conn):
+            configure_sqlite_storage(connection)
         init_main_db(main_conn)
         init_fts_db(fts_conn)
         ensure_language_token_tables(token_conn)
@@ -685,6 +852,8 @@ def rebuild_from_doc_dir(main_db_path: Path, fts_db_path: Path, token_db_path: P
         main_conn.commit()
         fts_conn.commit()
         token_conn.commit()
+        for connection in connections:
+            checkpoint_database_for_swap(connection)
     return imported, skipped, token_terms
 
 
@@ -720,15 +889,14 @@ def main() -> int:
     print(f"FTS DB: {FTS_DB_PATH}")
     print(f"Token DB: {TOKEN_DB_PATH}")
 
-    owns_data_lock = os.environ.get(DB_FIX_PARENT_LOCK_ENV) != "1"
     try:
-        if owns_data_lock:
-            acquire_data_lock()
+        acquire_data_lock()
         try:
+            if recover_incomplete_database_swap():
+                print("[WARN] rolled back an interrupted database swap from its backup")
             imported, skipped, token_terms = recreate_databases()
         finally:
-            if owns_data_lock:
-                release_data_lock()
+            release_data_lock()
     except Exception as error:
         print(f"[ERROR] failed to rebuild databases: {error}")
         return 1

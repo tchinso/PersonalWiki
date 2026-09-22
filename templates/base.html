@@ -6,6 +6,7 @@
     <title>{% block title %}Personal Wiki{% endblock %}</title>
     <link rel="icon" type="image/x-icon" href="{{ url_for('serve_image', filename='icon.ico') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style id="browser-font-setting">:root { --app-font: {{ browser_font_css }}; }</style>
     <script src="{{ url_for('static', filename='wiki.js') }}" defer></script>
     {% block extra_head %}{% endblock %}
   </head>
@@ -20,6 +21,7 @@
           <a href="{{ url_for('index') }}">문서 목록</a>
           <a href="{{ url_for('new_doc') }}">새 문서</a>
           <a href="{{ url_for('package_tool') }}">내보내기</a>
+          <a href="{{ url_for('settings') }}">설정</a>
         </nav>
         <form class="search-form" action="{{ url_for('search') }}" method="get">
           <input

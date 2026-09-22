@@ -1,0 +1,187 @@
+{
+  "document": {
+    "title": "문법 종합 검사",
+    "slug": "syntax-smoke",
+    "tags": ["검사", "문법"],
+    "content": "fixture only",
+    "created_at": "2026-09-22T17:00:00",
+    "updated_at": "2026-09-22T17:00:00"
+  },
+  "backlinks": [{"title": "역링크 문서", "slug": "backlink", "tags": []}],
+  "ast": [
+    {
+      "type": "heading",
+      "text": "",
+      "attrs": {"level": 1, "anchor": "document-title"},
+      "children": [{"type": "text", "text": "문법 종합 검사", "children": [], "attrs": {}}]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "text", "text": "일반 ", "children": [], "attrs": {}},
+        {"type": "emphasis", "text": "", "children": [{"type": "text", "text": "기울임", "children": [], "attrs": {}}], "attrs": {}},
+        {"type": "text", "text": " / ", "children": [], "attrs": {}},
+        {"type": "strong", "text": "", "children": [{"type": "text", "text": "굵게", "children": [], "attrs": {}}], "attrs": {}},
+        {"type": "text", "text": " / ", "children": [], "attrs": {}},
+        {"type": "strikethrough", "text": "", "children": [{"type": "text", "text": "취소", "children": [], "attrs": {}}], "attrs": {}},
+        {"type": "text", "text": " / ", "children": [], "attrs": {}},
+        {"type": "highlight", "text": "", "children": [{"type": "text", "text": "강조", "children": [], "attrs": {}}], "attrs": {}},
+        {"type": "text", "text": " / ", "children": [], "attrs": {}},
+        {"type": "codespan", "text": "inline()", "children": [], "attrs": {}},
+        {"type": "text", "text": " / ", "children": [], "attrs": {}},
+        {"type": "spoiler", "text": "", "children": [{"type": "text", "text": "숨긴 내용", "children": [], "attrs": {}}], "attrs": {}},
+        {"type": "linebreak", "text": "", "children": [], "attrs": {}},
+        {"type": "text", "text": "다음 줄", "children": [], "attrs": {}}
+      ]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "link", "text": "", "attrs": {"url": "/doc/known-slug", "kind": "wiki", "target": "Known"}, "children": [{"type": "text", "text": "위키 문서", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "/file/report.pdf", "kind": "file", "target": "file/report.pdf"}, "children": [{"type": "text", "text": "첨부 파일", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "https://example.com/", "kind": "external"}, "children": [{"type": "text", "text": "외부 링크", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "/new?title=%EC%83%88%20%EB%AC%B8%EC%84%9C", "kind": "new_document", "target": "새 문서"}, "children": [{"type": "text", "text": "새 문서", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "#section-one", "kind": "anchor"}, "children": [{"type": "text", "text": "섹션으로", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "/doc/%ZZ", "kind": "wiki"}, "children": [{"type": "text", "text": "잘못된 문서 링크", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "/new?title=%00", "kind": "new_document"}, "children": [{"type": "text", "text": "잘못된 새 문서", "children": [], "attrs": {}}]},
+        {"type": "text", "text": " · ", "children": [], "attrs": {}},
+        {"type": "link", "text": "", "attrs": {"url": "ms-settings:privacy", "kind": "external"}, "children": [{"type": "text", "text": "위험 링크", "children": [], "attrs": {}}]}
+      ]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "image", "text": "", "attrs": {"url": "/img/20260922/local.png", "alt": "로컬 이미지", "width": 320, "height": 180}, "children": [{"type": "text", "text": "로컬 이미지", "children": [], "attrs": {}}]},
+        {"type": "image", "text": "", "attrs": {"url": "https://example.com/remote.png", "alt": "외부 이미지", "width": 240, "height": 135}, "children": [{"type": "text", "text": "외부 이미지", "children": [], "attrs": {}}]}
+      ]
+    },
+    {
+      "type": "block_quote",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "paragraph", "text": "", "attrs": {}, "children": [{"type": "text", "text": "인용문", "children": [], "attrs": {}}]},
+        {"type": "block_quote", "text": "", "attrs": {}, "children": [{"type": "paragraph", "text": "", "attrs": {}, "children": [{"type": "text", "text": "중첩 인용", "children": [], "attrs": {}}]}]}
+      ]
+    },
+    {
+      "type": "list",
+      "text": "",
+      "attrs": {"ordered": false},
+      "children": [
+        {"type": "list_item", "text": "", "attrs": {}, "children": [
+          {"type": "block_text", "text": "", "attrs": {}, "children": [{"type": "text", "text": "일반 항목", "children": [], "attrs": {}}]},
+          {"type": "list", "text": "", "attrs": {"ordered": false}, "children": [{"type": "list_item", "text": "", "attrs": {}, "children": [{"type": "block_text", "text": "", "attrs": {}, "children": [{"type": "text", "text": "하위 항목", "children": [], "attrs": {}}]}]}]}
+        ]},
+        {"type": "task_list_item", "text": "", "attrs": {"checked": false}, "children": [{"type": "block_text", "text": "", "attrs": {}, "children": [{"type": "text", "text": "할 일", "children": [], "attrs": {}}]}]},
+        {"type": "task_list_item", "text": "", "attrs": {"checked": true}, "children": [{"type": "block_text", "text": "", "attrs": {}, "children": [{"type": "text", "text": "완료", "children": [], "attrs": {}}]}]}
+      ]
+    },
+    {
+      "type": "list",
+      "text": "",
+      "attrs": {"ordered": true, "start": 1},
+      "children": [{"type": "list_item", "text": "", "attrs": {}, "children": [{"type": "block_text", "text": "", "attrs": {}, "children": [{"type": "text", "text": "첫 번째", "children": [], "attrs": {}}]}]}]
+    },
+    {"type": "block_code", "text": "print('code')\n", "attrs": {"info": "python"}, "children": []},
+    {"type": "thematic_break", "text": "", "attrs": {}, "children": []},
+    {
+      "type": "table",
+      "text": "",
+      "attrs": {"column_widths": [0.333333, 0.666667]},
+      "children": [
+        {"type": "table_head", "text": "", "attrs": {}, "children": [
+          {"type": "table_cell", "text": "합친 제목", "attrs": {"head": true, "align": "left", "colspan": 2}, "children": []}
+        ]},
+        {"type": "table_body", "text": "", "attrs": {}, "children": [
+          {"type": "table_row", "text": "", "attrs": {}, "children": [
+            {"type": "table_cell", "text": "가운데", "attrs": {"head": false, "align": "center"}, "children": []},
+            {"type": "table_cell", "text": "오른쪽", "attrs": {"head": false, "align": "right"}, "children": []}
+          ]}
+        ]}
+      ]
+    },
+    {"type": "callout", "text": "노트 콜아웃", "attrs": {"level": "note", "lines": ["노트 콜아웃"]}, "children": []},
+    {"type": "callout", "text": "콜아웃 첫 줄\n콜아웃 둘째 줄", "attrs": {"level": "info", "lines": ["콜아웃 첫 줄", "콜아웃 둘째 줄"]}, "children": []},
+    {"type": "callout", "text": "경고 콜아웃", "attrs": {"level": "warn", "lines": ["경고 콜아웃"]}, "children": []},
+    {"type": "callout", "text": "위험 콜아웃", "attrs": {"level": "danger", "lines": ["위험 콜아웃"]}, "children": []},
+    {
+      "type": "template",
+      "text": "",
+      "attrs": {"ref": "일반 템플릿", "folded": false, "inline": false},
+      "children": [{"type": "paragraph", "text": "", "attrs": {}, "children": [{"type": "text", "text": "템플릿 본문", "children": [], "attrs": {}}]}]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [{"type": "template", "text": "", "attrs": {"ref": "인라인 템플릿", "folded": false, "inline": true}, "children": [{"type": "text", "text": "인라인 템플릿 본문", "children": [], "attrs": {}}]}]
+    },
+    {
+      "type": "template",
+      "text": "",
+      "attrs": {"ref": "접는 템플릿", "folded": true, "inline": false},
+      "children": [{"type": "paragraph", "text": "", "attrs": {}, "children": [{"type": "text", "text": "접힌 본문", "children": [], "attrs": {}}]}]
+    },
+    {"type": "heading", "text": "", "attrs": {"level": 2, "anchor": "section-one"}, "children": [{"type": "text", "text": "섹션 하나", "children": [], "attrs": {}}]},
+    {
+      "type": "toc",
+      "text": "",
+      "attrs": {"max_level": 3, "headings": [
+        {"level": 1, "title": "문법 종합 검사", "anchor": "document-title"},
+        {"level": 2, "title": "섹션 하나", "anchor": "section-one"}
+      ]},
+      "children": []
+    },
+    {
+      "type": "youtube",
+      "text": "",
+      "attrs": {"video_id": "HhnETSN6U_E", "width": 560, "height": 315, "start": 90},
+      "children": []
+    },
+    {
+      "type": "tag_embed",
+      "text": "",
+      "attrs": {"tag": "검사", "documents": [{"title": "알려진 문서", "slug": "known-slug", "url": "/doc/known-slug"}]},
+      "children": [{"type": "link", "text": "알려진 문서", "attrs": {"url": "/doc/known-slug", "kind": "wiki", "target": "알려진 문서"}, "children": []}]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "text", "text": "각주 참조", "attrs": {}, "children": []},
+        {"type": "footnote_ref", "text": "1", "attrs": {"index": 1}, "children": []}
+      ]
+    },
+    {
+      "type": "footnotes",
+      "text": "",
+      "attrs": {},
+      "children": [{"type": "footnote_item", "text": "", "attrs": {"index": 1}, "children": [{"type": "paragraph", "text": "", "attrs": {}, "children": [{"type": "text", "text": "각주 내용", "attrs": {}, "children": []}]}]}]
+    },
+    {
+      "type": "paragraph",
+      "text": "",
+      "attrs": {},
+      "children": [
+        {"type": "kbd", "text": "", "attrs": {}, "children": [{"type": "text", "text": "Ctrl", "attrs": {}, "children": []}]},
+        {"type": "text", "text": " + ", "attrs": {}, "children": []},
+        {"type": "kbd", "text": "", "attrs": {}, "children": [{"type": "text", "text": "S", "attrs": {}, "children": []}]}
+      ]
+    },
+    {"type": "html", "text": "<script>literal</script>", "attrs": {"trusted": false, "render_mode": "literal"}, "children": []}
+  ]
+}

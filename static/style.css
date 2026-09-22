@@ -39,6 +39,7 @@
   --shadow-soft: 0 18px 42px rgba(10, 10, 10, 0.06);
   --container: 1280px;
   --page-gutter: 24px;
+  --app-font: Inter, "Noto Sans KR", "Segoe UI", Roboto, sans-serif;
 }
 
 * {
@@ -56,7 +57,7 @@ body {
     radial-gradient(circle at 92% 18%, rgba(164, 212, 197, 0.2), transparent 24%),
     linear-gradient(180deg, var(--canvas) 0%, var(--surface-soft) 58%, var(--canvas) 100%);
   color: var(--body);
-  font-family: Inter, "Noto Sans KR", "Segoe UI", Roboto, sans-serif;
+  font-family: var(--app-font);
   font-size: 16px;
   line-height: 1.55;
 }
@@ -72,6 +73,7 @@ a:hover {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -461,7 +463,39 @@ button.secondary:hover {
   font-weight: 700;
 }
 
+.settings-form {
+  display: grid;
+  gap: 18px;
+}
+
+.settings-group {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+  background: var(--surface-soft);
+}
+
+.settings-group h2 {
+  margin: 0 0 2px;
+  color: var(--body-strong);
+  font-size: 17px;
+}
+
+.settings-group label {
+  color: var(--body-strong);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.settings-group .hint {
+  margin: 0;
+}
+
 input[type="text"],
+input[type="number"],
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--hairline);
@@ -472,8 +506,14 @@ textarea {
   outline: none;
 }
 
-input[type="text"] {
+input[type="text"],
+input[type="number"],
+select {
   min-height: 44px;
+}
+
+select {
+  cursor: pointer;
 }
 
 textarea {
@@ -572,6 +612,7 @@ textarea {
 }
 
 .error,
+.success,
 .danger-warning,
 .warning {
   padding: 12px 14px;
@@ -583,6 +624,12 @@ textarea {
   background: #fff1f0;
   border: 1px solid #f3c2be;
   color: #7a1e17;
+}
+
+.success {
+  background: #effcf3;
+  border: 1px solid #b7e5c3;
+  color: #17633a;
 }
 
 .danger-warning {

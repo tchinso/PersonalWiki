@@ -5,4 +5,9 @@
 wiki.db
 wiki_fts.db
 wiki_token.db
-/tests
+/tests/*
+!/tests/test_korean_suffix_stopwords.py
+!/tests/test_settings.py
+!/tests/test_markdown_ast.py
+!/tests/test_client_api.py
+!/tests/test_database_safety.py
