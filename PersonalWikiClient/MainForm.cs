@@ -23,7 +23,6 @@ internal sealed class MainForm : Form
         Dock = DockStyle.Fill,
         FixedPanel = FixedPanel.Panel1,
         IsSplitterFixed = false,
-        SplitterDistance = 288,
         SplitterWidth = 5,
     };
     private readonly ListBox _documentList = new()
@@ -40,17 +39,15 @@ internal sealed class MainForm : Form
     };
     private readonly Label _endpointLabel = new()
     {
-        AutoSize = false,
+        AutoSize = true,
         Dock = DockStyle.Bottom,
-        Height = 48,
         Padding = new Padding(12, 7, 12, 7),
         ForeColor = Color.DimGray,
     };
     private readonly Label _statusLabel = new()
     {
-        AutoSize = false,
+        AutoSize = true,
         Dock = DockStyle.Bottom,
-        Height = 25,
         Padding = new Padding(12, 4, 12, 3),
         ForeColor = Color.DimGray,
     };
@@ -61,25 +58,23 @@ internal sealed class MainForm : Form
     };
     private readonly Label _titleLabel = new()
     {
-        AutoSize = false,
+        AutoSize = true,
         Dock = DockStyle.Top,
-        Height = 37,
         Padding = new Padding(18, 7, 8, 0),
         Font = new Font("Segoe UI", 17, FontStyle.Bold),
     };
     private readonly Label _metadataLabel = new()
     {
-        AutoSize = false,
+        AutoSize = true,
         Dock = DockStyle.Top,
-        Height = 23,
         Padding = new Padding(19, 0, 8, 0),
         ForeColor = Color.DimGray,
     };
     private readonly FlowLayoutPanel _tagBar = new()
     {
-        AutoSize = false,
+        AutoSize = true,
+        AutoSizeMode = AutoSizeMode.GrowAndShrink,
         Dock = DockStyle.Top,
-        Height = 30,
         Padding = new Padding(18, 2, 8, 2),
         WrapContents = false,
         FlowDirection = FlowDirection.LeftToRight,
@@ -116,6 +111,8 @@ internal sealed class MainForm : Form
     private List<DocumentSummary> _documents = [];
     private WikiDocument? _activeDocument;
     private string? _activeSlug;
+    private NativeMarkdownRenderer? _documentRenderer;
+    private DocumentScrollRestore? _documentScrollPositionBeforeEditor;
     private bool _suppressSelection;
     private bool _isEditing;
     private readonly List<ClientImageAttachment> _attachmentsForCurrentEdit = [];
@@ -139,6 +136,11 @@ internal sealed class MainForm : Form
         BuildNavigation();
         BuildWorkspace();
         Controls.Add(_layout);
+        // SplitterDistance is clamped against a SplitContainer's tiny default
+        // width when set in its field initializer. Apply it only after docking
+        // it into the already-sized form so the navigation controls are visible.
+        _layout.Panel1MinSize = 320;
+        _layout.SplitterDistance = 340;
 
         Shown += async (_, _) => await ReloadDocumentsAsync();
         FormClosed += (_, _) => DisposeResources();
@@ -152,9 +154,8 @@ internal sealed class MainForm : Form
 
         var heading = new Label
         {
-            AutoSize = false,
+            AutoSize = true,
             Dock = DockStyle.Top,
-            Height = 39,
             Text = "PersonalWikiClient",
             Padding = new Padding(12, 8, 8, 0),
             Font = new Font(_documentFont.FontFamily, 13, FontStyle.Bold),
@@ -195,7 +196,7 @@ internal sealed class MainForm : Form
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Dock = DockStyle.Top,
             Padding = new Padding(12, 2, 12, 4),
-            WrapContents = false,
+            WrapContents = true,
         };
         var create = new Button { Text = "새 문서", AutoSize = true };
         var refresh = new Button { Text = "새로 고침", AutoSize = true };
@@ -213,9 +214,9 @@ internal sealed class MainForm : Form
         right.BackColor = Color.FromArgb(255, 250, 240);
         var actionBar = new FlowLayoutPanel
         {
-            AutoSize = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Dock = DockStyle.Top,
-            Height = 38,
             Padding = new Padding(18, 3, 8, 4),
             WrapContents = false,
         };
@@ -297,10 +298,18 @@ internal sealed class MainForm : Form
             return;
         }
 
-        if (_isEditing && !ConfirmDiscardChanges())
+        if (_isEditing)
         {
-            SelectDocumentInList(_activeSlug);
-            return;
+            if (!ConfirmDiscardChanges())
+            {
+                SelectDocumentInList(_activeSlug);
+                return;
+            }
+
+            // This is navigation away from an abandoned draft, not a return
+            // from Save/Cancel. Do not apply its old document viewport to the
+            // newly selected document.
+            _documentScrollPositionBeforeEditor = null;
         }
 
         var token = BeginOperation();
@@ -332,7 +341,6 @@ internal sealed class MainForm : Form
     private void ShowDocument(DocumentPayload payload)
     {
         SetHeader(payload.Document.Title, payload.Document.Tags, payload.Document.UpdatedAt, true);
-        ClearWorkspace();
         var renderer = new NativeMarkdownRenderer { Dock = DockStyle.Fill };
         renderer.Render(payload.Ast, new RendererActions
         {
@@ -347,13 +355,37 @@ internal sealed class MainForm : Form
             LoadLocalImageAsync = LoadLocalImageAsync,
             LoadRemoteImageAsync = LoadRemoteImageAsync,
         }, _documentFont);
-        _workspace.Controls.Add(renderer);
-
-        if (payload.Backlinks.Count > 0)
+        _workspace.SuspendLayout();
+        try
         {
-            var backlinks = CreateBacklinks(payload.Backlinks);
-            _workspace.Controls.Add(backlinks);
-            backlinks.BringToFront();
+            ClearWorkspace();
+            _documentRenderer = renderer;
+            _workspace.Controls.Add(renderer);
+
+            if (payload.Backlinks.Count > 0)
+            {
+                var backlinks = CreateBacklinks(payload.Backlinks);
+                _workspace.Controls.Add(backlinks);
+                backlinks.BringToFront();
+            }
+        }
+        finally
+        {
+            _workspace.ResumeLayout(true);
+        }
+
+        if (_documentScrollPositionBeforeEditor is DocumentScrollRestore savedScrollPosition)
+        {
+            // Layout the fresh renderer before applying the old offset. This
+            // restores the reader viewport before the UI paints instead of
+            // visibly jumping from the top after Save or Cancel.
+            _documentScrollPositionBeforeEditor = null;
+            if (string.Equals(savedScrollPosition.Slug, payload.Document.Slug, StringComparison.OrdinalIgnoreCase))
+            {
+                _workspace.PerformLayout();
+                renderer.PerformLayout();
+                renderer.RestoreScrollPosition(savedScrollPosition.Position);
+            }
         }
     }
 
@@ -393,6 +425,7 @@ internal sealed class MainForm : Form
 
         _activeDocument = null;
         _activeSlug = null;
+        _documentScrollPositionBeforeEditor = null;
         _isEditing = true;
         _attachmentsForCurrentEdit.Clear();
         ShowEditor(new WikiDocument(prefilledTitle ?? string.Empty, string.Empty, [], string.Empty, null, null));
@@ -406,6 +439,10 @@ internal sealed class MainForm : Form
             return;
         }
 
+        _documentScrollPositionBeforeEditor = _documentRenderer is { IsDisposed: false } renderer
+            && !string.IsNullOrWhiteSpace(_activeSlug)
+            ? new DocumentScrollRestore(_activeSlug, renderer.GetScrollPosition())
+            : null;
         _isEditing = true;
         _attachmentsForCurrentEdit.Clear();
         ShowEditor(_activeDocument);
@@ -414,7 +451,6 @@ internal sealed class MainForm : Form
     private void ShowEditor(WikiDocument document)
     {
         SetHeader(_activeSlug is null ? "새 문서" : "문서 편집", [], null, false);
-        ClearWorkspace();
         var editor = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -462,7 +498,22 @@ internal sealed class MainForm : Form
         editor.Controls.Add(tagRow, 0, 1);
         editor.Controls.Add(_editContent, 0, 2);
         editor.Controls.Add(buttons, 0, 3);
-        _workspace.Controls.Add(editor);
+        _workspace.SuspendLayout();
+        try
+        {
+            ClearWorkspace();
+            _workspace.Controls.Add(editor);
+        }
+        finally
+        {
+            _workspace.ResumeLayout(true);
+        }
+
+        // A multiline TextBox can otherwise retain a transient native scroll
+        // position while its parent view is being replaced. Set its initial
+        // caret and viewport before giving focus to the title field.
+        _editContent.Select(0, 0);
+        _editContent.ScrollToCaret();
         _editTitle.Focus();
     }
 
@@ -560,6 +611,13 @@ internal sealed class MainForm : Form
 
                 _activeSlug = result.Document.Slug;
                 _activeDocument = result.Document;
+                if (_documentScrollPositionBeforeEditor is DocumentScrollRestore savedScrollPosition)
+                {
+                    // Saving a title change can change the slug. Keep the
+                    // viewport associated with the saved document, rather
+                    // than treating its new response as an unrelated view.
+                    _documentScrollPositionBeforeEditor = savedScrollPosition with { Slug = _activeSlug };
+                }
                 _isEditing = false;
                 var finalContent = _editContent.Text;
                 var attachmentsToCopy = ClipboardImageAttachments.ReferencedInContent(finalContent, _attachmentsForCurrentEdit);
@@ -873,6 +931,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        _documentScrollPositionBeforeEditor = null;
         var token = BeginOperation();
         try
         {
@@ -928,6 +987,7 @@ internal sealed class MainForm : Form
         // only after settings persistence succeeds, so a failed save leaves
         // the draft fully active.
         _isEditing = false;
+        _documentScrollPositionBeforeEditor = null;
         ApplyClientFont();
         if (portChanged)
         {
@@ -1317,6 +1377,7 @@ internal sealed class MainForm : Form
 
     private void ClearWorkspace()
     {
+        _documentRenderer = null;
         foreach (Control control in _workspace.Controls.Cast<Control>().ToArray())
         {
             control.Dispose();
@@ -1362,6 +1423,8 @@ internal sealed class MainForm : Form
         _documentFont.Dispose();
         FontCache.DisposeCachedFonts();
     }
+
+    private sealed record DocumentScrollRestore(string Slug, Point Position);
 
     private sealed record DocumentListItem(DocumentSummary Document)
     {

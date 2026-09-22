@@ -172,6 +172,26 @@ internal sealed class NativeMarkdownRenderer : UserControl
         _tocPanels.Clear();
     }
 
+    /// <summary>
+    /// Gets the current reader viewport as a conventional non-negative offset.
+    /// WinForms exposes <see cref="ScrollableControl.AutoScrollPosition"/>
+    /// with negative coordinates when reading it, so keep that detail inside
+    /// the renderer rather than leaking it to the form.
+    /// </summary>
+    public Point GetScrollPosition()
+    {
+        var position = _scrollHost.AutoScrollPosition;
+        return new Point(Math.Max(0, -position.X), Math.Max(0, -position.Y));
+    }
+
+    /// <summary>Restores a viewport captured with <see cref="GetScrollPosition"/>.</summary>
+    public void RestoreScrollPosition(Point position)
+    {
+        _scrollHost.AutoScrollPosition = new Point(
+            Math.Max(0, position.X),
+            Math.Max(0, position.Y));
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)

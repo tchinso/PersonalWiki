@@ -28,7 +28,9 @@ internal sealed class SettingsDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(525, 282);
+        // The original 282px client height compressed the explanatory text
+        // to a one-pixel row at common Windows DPI settings.
+        ClientSize = new Size(560, 360);
 
         var body = new TableLayoutPanel
         {
@@ -40,7 +42,7 @@ internal sealed class SettingsDialog : Form
         body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         body.Controls.Add(new Label

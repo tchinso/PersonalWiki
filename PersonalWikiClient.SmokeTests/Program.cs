@@ -18,6 +18,9 @@ internal static class Program
             RunAttachmentStoreSmokeTest();
             RunWebpDecodeSmokeTest();
             RunImageLoadConcurrencySmokeTest();
+            RunMainFormLayoutSmokeTest();
+            RunSettingsDialogLayoutSmokeTest();
+            RunEditorScrollRestoreSmokeTest();
             Assert(RendererActions.TryGetAllowedExternalUri("https%3A%2F%2Fexample.com%2Fcanonical", out var canonical)
                 && canonical.AbsoluteUri == "https://example.com/canonical", "canonical external URL dispatch");
             Assert(!RendererActions.TryGetAllowedExternalUri("shell:AppsFolder", out _), "dangerous protocol validation");
@@ -129,6 +132,131 @@ internal static class Program
         using var terminalPage = JsonDocument.Parse("{\"next_offset\":null}");
         Assert(JsonValue.Int(terminalPage.RootElement, "next_offset") is null,
             "terminal pagination accepts a null next_offset");
+    }
+
+    private static void RunMainFormLayoutSmokeTest()
+    {
+        using var form = new MainForm();
+        form.CreateControl();
+        form.PerformLayout();
+
+        var layout = GetPrivateField<SplitContainer>(form, "_layout");
+        Assert(layout.SplitterDistance >= 340 && layout.Panel1.ClientSize.Width >= layout.Panel1MinSize,
+            "navigation splitter is applied after the form is laid out");
+
+        var navigationButtons = layout.Panel1.Controls
+            .OfType<FlowLayoutPanel>()
+            .Single(panel => panel.Controls.OfType<Button>().Any(button => button.Text == "연결·글꼴"));
+        navigationButtons.PerformLayout();
+        AssertChildrenFit(navigationButtons, "navigation buttons remain visible");
+
+        AssertFitsVertically(GetPrivateField<Label>(form, "_titleLabel"), "title bar fits its font and padding");
+        AssertFitsVertically(GetPrivateField<Label>(form, "_metadataLabel"), "metadata bar fits its font and padding");
+        AssertFitsVertically(GetPrivateField<Label>(form, "_statusLabel"), "status bar fits its font and padding");
+        AssertFitsVertically(GetPrivateField<Label>(form, "_endpointLabel"), "endpoint label fits its two lines");
+
+        var editButton = GetPrivateField<Button>(form, "_editButton");
+        var actionBar = layout.Panel2.Controls
+            .OfType<FlowLayoutPanel>()
+            .Single(panel => panel.Controls.Contains(editButton));
+        actionBar.PerformLayout();
+        AssertChildrenFit(actionBar, "document action buttons remain visible");
+    }
+
+    private static void RunSettingsDialogLayoutSmokeTest()
+    {
+        using var dialog = new SettingsDialog(new ClientSettings());
+        dialog.CreateControl();
+        dialog.PerformLayout();
+
+        var body = dialog.Controls.OfType<TableLayoutPanel>().Single();
+        body.PerformLayout();
+        var localityNotice = body.Controls
+            .OfType<Label>()
+            .Single(label => label.Text.StartsWith("항상 127.0.0.1", StringComparison.Ordinal));
+        AssertFitsVertically(localityNotice, "settings locality notice is not compressed");
+        Assert(body.Controls.Cast<Control>().All(control =>
+                control.Bottom <= body.ClientSize.Height - body.Padding.Bottom),
+            "settings controls fit inside the dialog");
+    }
+
+    private static void RunEditorScrollRestoreSmokeTest()
+    {
+        using var form = new MainForm();
+        form.CreateControl();
+        form.PerformLayout();
+        var document = new WikiDocument("스크롤 위치", "scroll-position", [], string.Empty, null, null);
+        var ast = Enumerable.Range(0, 80)
+            .Select(index => new AstNode("paragraph", $"문단 {index}", null, []))
+            .ToArray();
+        var payload = new DocumentPayload(document, ast, []);
+
+        InvokePrivate(form, "ShowDocument", payload);
+        form.PerformLayout();
+
+        SetPrivateField(form, "_activeDocument", document);
+        SetPrivateField(form, "_activeSlug", document.Slug);
+        InvokePrivate(form, "BeginEditActiveDocument");
+        var capturedScroll = GetPrivateValue(form, "_documentScrollPositionBeforeEditor");
+        Assert(capturedScroll?.GetType().GetProperty("Slug")?.GetValue(capturedScroll) is string capturedSlug
+            && capturedSlug == document.Slug,
+            "reader viewport is captured with its document identity before entering the editor");
+        InvokePrivate(form, "ShowDocument", payload);
+        form.PerformLayout();
+        Assert(GetPrivateValue(form, "_documentScrollPositionBeforeEditor") is null,
+            "captured reader viewport is restored and consumed after returning from the editor");
+
+        InvokePrivate(form, "BeginEditActiveDocument");
+        var unrelatedDocument = document with { Title = "다른 문서", Slug = "other-document" };
+        InvokePrivate(form, "ShowDocument", new DocumentPayload(unrelatedDocument, ast, []));
+        Assert(GetPrivateValue(form, "_documentScrollPositionBeforeEditor") is null,
+            "a saved viewport is discarded instead of applying to another document");
+    }
+
+    private static void AssertChildrenFit(FlowLayoutPanel panel, string coverage)
+    {
+        var contentRight = panel.ClientSize.Width - panel.Padding.Right;
+        var contentBottom = panel.ClientSize.Height - panel.Padding.Bottom;
+        Assert(panel.Controls.Cast<Control>().All(control =>
+                control.Left >= panel.Padding.Left
+                && control.Right <= contentRight
+                && control.Bottom <= contentBottom), coverage);
+    }
+
+    private static void AssertFitsVertically(Control control, string coverage)
+    {
+        var preferredHeight = control.GetPreferredSize(new Size(Math.Max(1, control.ClientSize.Width), 0)).Height;
+        Assert(control.Height >= preferredHeight, coverage);
+    }
+
+    private static T GetPrivateField<T>(object target, string name)
+        where T : class
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Private field was not found: {name}");
+        return field.GetValue(target) as T
+            ?? throw new InvalidOperationException($"Private field has an unexpected type: {name}");
+    }
+
+    private static void SetPrivateField<T>(object target, string name, T value)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Private field was not found: {name}");
+        field.SetValue(target, value);
+    }
+
+    private static object? GetPrivateValue(object target, string name)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Private field was not found: {name}");
+        return field.GetValue(target);
+    }
+
+    private static void InvokePrivate(object target, string name, params object?[] arguments)
+    {
+        var method = target.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Private method was not found: {name}");
+        method.Invoke(target, arguments);
     }
 
     private static void RunAttachmentStoreSmokeTest()
