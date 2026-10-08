@@ -341,7 +341,11 @@ internal sealed class MainForm : Form
     private void ShowDocument(DocumentPayload payload)
     {
         SetHeader(payload.Document.Title, payload.Document.Tags, payload.Document.UpdatedAt, true);
-        var renderer = new NativeMarkdownRenderer { Dock = DockStyle.Fill };
+        var renderer = new NativeMarkdownRenderer
+        {
+            Dock = DockStyle.Fill,
+            Size = _workspace.ClientSize,
+        };
         renderer.Render(payload.Ast, new RendererActions
         {
             OpenDocumentAsync = LoadDocumentAsync,
@@ -355,24 +359,15 @@ internal sealed class MainForm : Form
             LoadLocalImageAsync = LoadLocalImageAsync,
             LoadRemoteImageAsync = LoadRemoteImageAsync,
         }, _documentFont);
-        _workspace.SuspendLayout();
-        try
+        if (payload.Backlinks.Count > 0)
         {
-            ClearWorkspace();
-            _documentRenderer = renderer;
-            _workspace.Controls.Add(renderer);
-
-            if (payload.Backlinks.Count > 0)
-            {
-                var backlinks = CreateBacklinks(payload.Backlinks);
-                _workspace.Controls.Add(backlinks);
-                backlinks.BringToFront();
-            }
+            ReplaceWorkspace(renderer, CreateBacklinks(payload.Backlinks));
         }
-        finally
+        else
         {
-            _workspace.ResumeLayout(true);
+            ReplaceWorkspace(renderer);
         }
+        _documentRenderer = renderer;
 
         if (_documentScrollPositionBeforeEditor is DocumentScrollRestore savedScrollPosition)
         {
@@ -498,16 +493,7 @@ internal sealed class MainForm : Form
         editor.Controls.Add(tagRow, 0, 1);
         editor.Controls.Add(_editContent, 0, 2);
         editor.Controls.Add(buttons, 0, 3);
-        _workspace.SuspendLayout();
-        try
-        {
-            ClearWorkspace();
-            _workspace.Controls.Add(editor);
-        }
-        finally
-        {
-            _workspace.ResumeLayout(true);
-        }
+        ReplaceWorkspace(editor);
 
         // A multiline TextBox can otherwise retain a transient native scroll
         // position while its parent view is being replaced. Set its initial
@@ -1025,7 +1011,6 @@ internal sealed class MainForm : Form
     {
         _isEditing = false;
         SetHeader("문서를 선택하세요", [], null, false);
-        ClearWorkspace();
         var message = new TableLayoutPanel
         {
             AutoSize = true,
@@ -1052,7 +1037,7 @@ internal sealed class MainForm : Form
         var retry = new Button { AutoSize = true, Text = "연결 다시 시도" };
         retry.Click += async (_, _) => await ReloadDocumentsAsync();
         message.Controls.Add(retry, 0, 2);
-        _workspace.Controls.Add(message);
+        ReplaceWorkspace(message);
     }
 
     private void ShowConnectionFailure(Exception error)
@@ -1064,7 +1049,6 @@ internal sealed class MainForm : Form
 
         _isEditing = false;
         SetHeader("서버에 연결할 수 없습니다", [], null, false);
-        ClearWorkspace();
         var panel = new TableLayoutPanel
         {
             AutoSize = true,
@@ -1095,7 +1079,7 @@ internal sealed class MainForm : Form
         settings.Click += async (_, _) => await EditSettingsAsync();
         buttons.Controls.AddRange([retry, settings]);
         panel.Controls.Add(buttons, 0, 2);
-        _workspace.Controls.Add(panel);
+        ReplaceWorkspace(panel);
         SetStatus("서버 연결 실패");
     }
 
@@ -1131,29 +1115,39 @@ internal sealed class MainForm : Form
 
     private void SetHeader(string title, IReadOnlyList<string> tags, string? updatedAt, bool canEdit)
     {
-        _titleLabel.Text = title;
-        _metadataLabel.Text = string.IsNullOrWhiteSpace(updatedAt) ? string.Empty : $"수정: {updatedAt}";
-        _editButton.Enabled = canEdit;
-        _deleteButton.Enabled = canEdit;
-        // ControlCollection.Clear only detaches child controls. Explicitly
-        // dispose the old LinkLabels so repeated document navigation cannot
-        // accumulate delayed GDI/window-handle cleanup.
-        foreach (Control control in _tagBar.Controls.Cast<Control>().ToArray())
+        _layout.Panel2.SuspendLayout();
+        _tagBar.SuspendLayout();
+        try
         {
-            control.Dispose();
-        }
-
-        _tagBar.Controls.Clear();
-        foreach (var tag in tags)
-        {
-            var tagLink = new LinkLabel
+            _titleLabel.Text = title;
+            _metadataLabel.Text = string.IsNullOrWhiteSpace(updatedAt) ? string.Empty : $"수정: {updatedAt}";
+            _editButton.Enabled = canEdit;
+            _deleteButton.Enabled = canEdit;
+            // Batch header changes too: each removed tag must not resize the
+            // live reader and recalculate its scrollbar independently.
+            var previousTags = _tagBar.Controls.Cast<Control>().ToArray();
+            _tagBar.Controls.Clear();
+            foreach (var control in previousTags)
             {
-                AutoSize = true,
-                Text = "#" + tag,
-                Margin = new Padding(0, 0, 9, 0),
-            };
-            tagLink.LinkClicked += async (_, _) => await ShowTagDocumentsAsync(tag);
-            _tagBar.Controls.Add(tagLink);
+                control.Dispose();
+            }
+
+            foreach (var tag in tags)
+            {
+                var tagLink = new LinkLabel
+                {
+                    AutoSize = true,
+                    Text = "#" + tag,
+                    Margin = new Padding(0, 0, 9, 0),
+                };
+                tagLink.LinkClicked += async (_, _) => await ShowTagDocumentsAsync(tag);
+                _tagBar.Controls.Add(tagLink);
+            }
+        }
+        finally
+        {
+            _tagBar.ResumeLayout(true);
+            _layout.Panel2.ResumeLayout(true);
         }
     }
 
@@ -1375,15 +1369,36 @@ internal sealed class MainForm : Form
 
     private void SetStatus(string message) => _statusLabel.Text = message;
 
-    private void ClearWorkspace()
+    private void ReplaceWorkspace(params Control[] replacements)
     {
         _documentRenderer = null;
-        foreach (Control control in _workspace.Controls.Cast<Control>().ToArray())
+        var previous = _workspace.Controls.Cast<Control>().ToArray();
+        _workspace.SuspendLayout();
+        try
+        {
+            // Install the completed view before detaching its predecessor.
+            // Disposing a renderer while it is still on screen lets its scroll
+            // panel recalculate and paint a shrinking extent for every removed
+            // block, even when the workspace itself has suspended layout.
+            _workspace.Controls.AddRange(replacements);
+            foreach (var control in replacements)
+            {
+                control.BringToFront();
+            }
+            foreach (var control in previous)
+            {
+                _workspace.Controls.Remove(control);
+            }
+        }
+        finally
+        {
+            _workspace.ResumeLayout(true);
+        }
+
+        foreach (var control in previous)
         {
             control.Dispose();
         }
-
-        _workspace.Controls.Clear();
     }
 
     private static IReadOnlyList<string> ParseTags(string text) => text

@@ -132,6 +132,7 @@ internal sealed class NativeMarkdownRenderer : UserControl
     {
         ResetImageLoads();
         SuspendLayout();
+        _scrollHost.SuspendLayout();
         _body.SuspendLayout();
         try
         {
@@ -140,7 +141,6 @@ internal sealed class NativeMarkdownRenderer : UserControl
             _anchors.Clear();
             _tocPanels.Clear();
             DisposeChildControls(_body);
-            _body.Controls.Clear();
             _body.RowStyles.Clear();
             _body.RowCount = 0;
 
@@ -159,6 +159,7 @@ internal sealed class NativeMarkdownRenderer : UserControl
         finally
         {
             _body.ResumeLayout(true);
+            _scrollHost.ResumeLayout(true);
             ResumeLayout(true);
         }
     }
@@ -166,10 +167,21 @@ internal sealed class NativeMarkdownRenderer : UserControl
     public void ClearDocument()
     {
         CancelImageLoads();
-        DisposeChildControls(_body);
-        _body.Controls.Clear();
-        _anchors.Clear();
-        _tocPanels.Clear();
+        _scrollHost.SuspendLayout();
+        _body.SuspendLayout();
+        try
+        {
+            DisposeChildControls(_body);
+            _body.RowStyles.Clear();
+            _body.RowCount = 0;
+            _anchors.Clear();
+            _tocPanels.Clear();
+        }
+        finally
+        {
+            _body.ResumeLayout(true);
+            _scrollHost.ResumeLayout(true);
+        }
     }
 
     /// <summary>
@@ -201,8 +213,11 @@ internal sealed class NativeMarkdownRenderer : UserControl
             _imageLoads.Dispose();
             if (!_body.IsDisposed)
             {
+                // Layout must stay suspended until the controls themselves
+                // are destroyed; there is no final visible document to lay out.
+                _scrollHost.SuspendLayout();
+                _body.SuspendLayout();
                 DisposeChildControls(_body);
-                _body.Controls.Clear();
             }
 
             DisposeImageLoadSlotsWhenIdle();
@@ -1465,7 +1480,9 @@ internal sealed class NativeMarkdownRenderer : UserControl
 
     private static void DisposeChildControls(Control parent)
     {
-        foreach (Control child in parent.Controls.Cast<Control>().ToArray())
+        var children = parent.Controls.Cast<Control>().ToArray();
+        parent.Controls.Clear();
+        foreach (var child in children)
         {
             DisposeControlTree(child);
         }

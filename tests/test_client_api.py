@@ -218,6 +218,40 @@ class ClientApiTests(unittest.TestCase):
             )
             self.assertEqual(saved_as_is.status_code, 201, saved_as_is.get_data(as_text=True))
 
+    def test_new_spelling_rules_warn_then_autofix_title_and_body(self) -> None:
+        title = "그 동안 한 동안"
+        content = (
+            "# 경험\n\n"
+            "- 그 일은 시험이였다.\n"
+            "- 못 하고도 못 하게끔 못 하는데 못 한다고 말했다.\n"
+            "- 이 때문에 그 때문에 시간이 걸렸다.\n"
+        )
+        payload = self.document_payload(title, content=content, tags=["spell", "api"])
+
+        warning = self.client.post("/api/client/documents", json=payload)
+        self.assertEqual(warning.status_code, 409, warning.get_data(as_text=True))
+        self.assertTrue(warning.get_json()["needs_spellcheck_decision"])
+        self.assertEqual(len(warning.get_json()["spellcheck_samples"]), 7)
+        self.assertEqual(self.client.get("/api/client/documents").get_json()["documents"], [])
+
+        saved = self.client.post(
+            "/api/client/documents",
+            json={**payload, "spellcheck_action": "auto_fix"},
+        )
+        self.assertEqual(saved.status_code, 201, saved.get_data(as_text=True))
+        document = saved.get_json()["document"]
+        self.assertEqual(document["title"], "그동안 한동안")
+        self.assertEqual(
+            document["content"],
+            "# 경험\n\n"
+            "- 그 일은 시험이었다.\n"
+            "- 못하고도 못하게끔 못하는데 못한다고 말했다.\n"
+            "- 이 때문에 그 때문에 시간이 걸렸다.\n",
+        )
+        fetched = self.client.get(f"/api/client/documents/{document['slug']}")
+        self.assertEqual(fetched.get_json()["document"]["content"], document["content"])
+        self.assertIsNone(app.collect_korean_spell_issues(document["title"], document["content"]))
+
     def test_browser_forms_use_the_same_validation_and_persistence_helpers(self) -> None:
         created = self.client.post(
             "/new",

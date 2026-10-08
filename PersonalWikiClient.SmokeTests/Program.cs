@@ -20,6 +20,8 @@ internal static class Program
             RunImageLoadConcurrencySmokeTest();
             RunMainFormLayoutSmokeTest();
             RunSettingsDialogLayoutSmokeTest();
+            RunDocumentReplacementSmokeTest();
+            RunRendererClearLayoutSmokeTest();
             RunEditorScrollRestoreSmokeTest();
             Assert(RendererActions.TryGetAllowedExternalUri("https%3A%2F%2Fexample.com%2Fcanonical", out var canonical)
                 && canonical.AbsoluteUri == "https://example.com/canonical", "canonical external URL dispatch");
@@ -211,6 +213,91 @@ internal static class Program
         InvokePrivate(form, "ShowDocument", new DocumentPayload(unrelatedDocument, ast, []));
         Assert(GetPrivateValue(form, "_documentScrollPositionBeforeEditor") is null,
             "a saved viewport is discarded instead of applying to another document");
+    }
+
+    private static void RunDocumentReplacementSmokeTest()
+    {
+        using var form = new MainForm();
+        _ = form.Handle;
+        form.PerformLayout();
+        var document = new WikiDocument("긴 문서", "long-document", [], string.Empty, null, null);
+        var ast = Enumerable.Range(0, 80)
+            .Select(index => new AstNode("paragraph", $"교체할 문단 {index}", null, []))
+            .ToArray();
+        InvokePrivate(form, "ShowDocument", new DocumentPayload(document, ast, []));
+        var workspace = GetPrivateField<Panel>(form, "_workspace");
+        var previous = GetPrivateField<NativeMarkdownRenderer>(form, "_documentRenderer");
+        var scrollHost = GetPrivateField<Panel>(previous, "_scrollHost");
+        var body = GetPrivateField<TableLayoutPanel>(previous, "_body");
+        _ = previous.Handle;
+        _ = scrollHost.Handle;
+        _ = body.Handle;
+        body.PerformLayout();
+        scrollHost.PerformLayout();
+        Assert(scrollHost.VerticalScroll.Visible, "a long document has a native scrollbar before replacement");
+
+        var disposedBlocks = 0;
+        foreach (Control block in body.Controls)
+        {
+            block.Disposed += (_, _) =>
+            {
+                Assert(previous.Parent is null,
+                    "old document blocks are disposed only after their renderer leaves the live workspace");
+                Assert(workspace.Controls.OfType<NativeMarkdownRenderer>()
+                        .Any(renderer => renderer != previous && !renderer.IsDisposed),
+                    "the next reader is installed before old document blocks are disposed");
+                disposedBlocks++;
+            };
+        }
+
+        var nextDocument = document with { Title = "다음 문서", Slug = "next-document" };
+        InvokePrivate(form, "ShowDocument", new DocumentPayload(nextDocument, ast,
+            [new DocumentSummary("연결 문서", "backlink", [], null, null)]));
+        Assert(previous.IsDisposed && disposedBlocks == ast.Length,
+            "document replacement still disposes every old block");
+        Assert(workspace.Controls.OfType<FlowLayoutPanel>().Any(panel => panel.Dock == DockStyle.Bottom),
+            "the replacement reader keeps its backlinks");
+
+        var reader = GetPrivateField<NativeMarkdownRenderer>(form, "_documentRenderer");
+        var readerBody = GetPrivateField<TableLayoutPanel>(reader, "_body");
+        var editorReplacedReader = false;
+        readerBody.Controls[0].Disposed += (_, _) =>
+        {
+            Assert(reader.Parent is null && workspace.Controls.OfType<TableLayoutPanel>().Any(),
+                "entering the editor installs it before disposing the detached reader");
+            editorReplacedReader = true;
+        };
+        SetPrivateField(form, "_activeDocument", nextDocument);
+        SetPrivateField(form, "_activeSlug", nextDocument.Slug);
+        InvokePrivate(form, "BeginEditActiveDocument");
+        Assert(editorReplacedReader && reader.IsDisposed, "editor replacement disposes the previous reader");
+    }
+
+    private static void RunRendererClearLayoutSmokeTest()
+    {
+        using var host = new Form { Size = new Size(1024, 768) };
+        using var renderer = new NativeMarkdownRenderer { Dock = DockStyle.Fill };
+        using var documentFont = new Font("Segoe UI", 10);
+        host.Controls.Add(renderer);
+        _ = host.Handle;
+        _ = renderer.Handle;
+        var scrollHost = GetPrivateField<Panel>(renderer, "_scrollHost");
+        var body = GetPrivateField<TableLayoutPanel>(renderer, "_body");
+        _ = scrollHost.Handle;
+        _ = body.Handle;
+        var ast = Enumerable.Range(0, 80)
+            .Select(index => new AstNode("paragraph", $"지울 문단 {index}", null, []))
+            .ToArray();
+        renderer.Render(ast, new RendererActions(), documentFont);
+        var observedBlockCounts = new List<int>();
+        scrollHost.Layout += (_, _) => observedBlockCounts.Add(body.Controls.Count);
+        renderer.ClearDocument();
+        Assert(body.Controls.Count == 0 && body.RowCount == 0,
+            "clearing a document resets its blocks and row extent");
+        Assert(observedBlockCounts.All(count => count == 0),
+            "the scroll panel never lays out a partially cleared document");
+        Assert(!scrollHost.VerticalScroll.Visible,
+            "the scrollbar is recalculated after the complete document has been cleared");
     }
 
     private static void AssertChildrenFit(FlowLayoutPanel panel, string coverage)
